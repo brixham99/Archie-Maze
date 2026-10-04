@@ -4,8 +4,8 @@
 Play:  python3 game.py
 Test:  SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --screenshot preview.png --frames 8
 
-Left and right turn the viewpoint. Up steps forward, down steps back.
-The maze rotates around Archie so forward always points up the screen.
+Left and right turn Archie. Up steps forward, down steps back.
+The maze stays put; the camera scrolls so he stays centred.
 """
 
 from __future__ import annotations
@@ -37,39 +37,21 @@ WIN_H = 720
 MAZE_SIZE = 41  # odd, so a perfect maze has a solid border
 WALL, PATH, EXIT = 0, 1, 2
 
-# Clockwise as seen on the unrotated isometric screen.
+# Clockwise on the unrotated isometric screen: SE, SW, NW, NE.
 DIR_SE = (1, 0)
 DIR_SW = (0, 1)
 DIR_NW = (-1, 0)
 DIR_NE = (0, -1)
 DIR_ORDER = (DIR_SE, DIR_SW, DIR_NW, DIR_NE)
+FACING_SPRITE = {
+    DIR_SE: "se",
+    DIR_SW: "sw",
+    DIR_NW: "nw",
+    DIR_NE: "ne",
+}
 
-# Screen-space angle of each facing, unwrapped so a right turn increases it.
-def _screen_angle(direction):
-    dc, dr = direction
-    sx = (dc - dr) * (TILE_W // 2)
-    sy = (dc + dr) * (TILE_H // 2)
-    return math.atan2(sy, sx)
-
-
-_RAW_ALPHA = [_screen_angle(d) for d in DIR_ORDER]
-FACING_ALPHA = [_RAW_ALPHA[0]]
-for _a in _RAW_ALPHA[1:]:
-    while _a <= FACING_ALPHA[-1] + 1e-9:
-        _a += math.tau
-    FACING_ALPHA.append(_a)
-# Positive alpha change for one clockwise (right) turn from each facing.
-TURN_DELTA = []
-for _i in range(4):
-    _d = FACING_ALPHA[(_i + 1) % 4] - FACING_ALPHA[_i]
-    if _d <= 0:
-        _d += math.tau
-    TURN_DELTA.append(_d)
-
-# Floors are drawn before the blocks so the whole maze stays readable from
-# above. Hedges in front of Archie are then painted over his feet, so he
-# tucks into the near wall without the hedge swallowing him.
-OCCLUDE_BIAS = 1.0
+# One back-to-front pass. Archie is inserted when the tiles in front of him
+# start, so a near hedge can cover his feet without being drawn twice.
 BG_COLOUR = (34, 22, 14)
 DIRT_EDGE = (68, 44, 26)
 N_DIRT = 16
@@ -77,6 +59,10 @@ DIRT_SHADES = (0.90, 0.97, 1.03)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SPRITE_FILES = {
+    "se": os.path.join(HERE, "assets", "archie_se.png"),
+    "sw": os.path.join(HERE, "assets", "archie_sw.png"),
+    "nw": os.path.join(HERE, "assets", "archie_nw.png"),
+    "ne": os.path.join(HERE, "assets", "archie_ne.png"),
     "n": os.path.join(HERE, "assets", "archie_n.png"),
     "e": os.path.join(HERE, "assets", "archie_e.png"),
     "w": os.path.join(HERE, "assets", "archie_w.png"),
@@ -119,11 +105,6 @@ def diamond_points(tx: float, ty: float):
         (tx, ty + TILE_H + 1),
         (tx - hw - 1, ty + hh),
     )
-
-
-def rest_yaw(index: int) -> float:
-    """Yaw that sends this facing's screen delta straight up."""
-    return -math.pi / 2 - FACING_ALPHA[index]
 
 
 def generate_maze(size: int, seed: int):
@@ -329,8 +310,6 @@ class Game:
         self.shadow = pygame.Surface((40, 16), pygame.SRCALPHA)
         pygame.draw.ellipse(self.shadow, (48, 30, 16, 110), self.shadow.get_rect())
         self.dirt = build_dirt_variants(make_dirt_texture())
-        self._dirt_cache_yaw = None
-        self._dirt_cache = {}
         self.font_hint = load_font(18)
         self.font_big = load_font(36, bold=True)
         self.font_small = load_font(20)
@@ -346,9 +325,7 @@ class Game:
         self.dst = (1, 1)
         self.facing_index = 0
         self.facing = DIR_ORDER[0]
-        self.yaw_rest = rest_yaw(0)
-        self.yaw_from = self.yaw_rest
-        self.yaw_to = self.yaw_rest
+        self.turn_from = DIR_ORDER[0]
         self.turning = False
         self.turn_t0 = 0
         self.turn_sign = 0
@@ -368,37 +345,28 @@ class Game:
     def busy(self) -> bool:
         return self.moving or self.turning
 
-    def current_yaw(self, now: float) -> float:
-        if not self.turning:
-            return self.yaw_rest
-        t = ease((now - self.turn_t0) / TURN_MS)
-        return self.yaw_from + (self.yaw_to - self.yaw_from) * t
-
     def pose(self, now: float) -> str:
-        """At rest he faces up-screen, so the back view stays on.
+        """At rest, the sprite for the facing he is actually pointing.
 
-        A right turn shows the east sprite through the middle of the yaw,
-        a left turn the west sprite, and both end on the back view again.
+        A turn keeps the facing he started on, then settles on the new one.
+        The extra side-on pictures do not belong in the middle. The maze does not spin.
         """
         if not self.turning:
-            return "n"
+            return FACING_SPRITE[self.facing]
         t = (now - self.turn_t0) / TURN_MS
-        if t < 0.22 or t > 0.78:
-            return "n"
-        return "e" if self.turn_sign > 0 else "w"
+        if t < 0.5:
+            return FACING_SPRITE[self.turn_from]
+        return FACING_SPRITE[self.facing]
 
     def _start_turn(self, sign: int, now: float):
         index = self.facing_index
+        self.turn_from = DIR_ORDER[index]
         if sign > 0:
-            dyaw = -TURN_DELTA[index]
             index = (index + 1) % 4
         else:
             index = (index - 1) % 4
-            dyaw = TURN_DELTA[index]
         self.facing_index = index
         self.facing = DIR_ORDER[index]
-        self.yaw_from = self.yaw_rest
-        self.yaw_to = self.yaw_rest + dyaw
         self.turn_t0 = now
         self.turning = True
         self.turn_sign = sign
@@ -509,7 +477,6 @@ class Game:
         if self.turning:
             if now - self.turn_t0 >= TURN_MS:
                 self.turning = False
-                self.yaw_rest = self.yaw_to
                 self._fire_queued(now)
             return
         if not self.moving:
@@ -538,144 +505,111 @@ class Game:
             self.bump_dir = None
         return float(self.col), float(self.row)
 
-    def _rotated_dirt(self, variant: int, shade: int, yaw: float):
-        # Same angle the tile points use. Modulo keeps pygame's rotate stable
-        # after a long series of turns, without changing the pictured yaw.
-        deg = (-math.degrees(yaw)) % 360.0
-        key_yaw = round(deg, 3)
-        if self._dirt_cache_yaw != key_yaw:
-            self._dirt_cache_yaw = key_yaw
-            self._dirt_cache = {}
-        key = (variant, shade)
-        sprite = self._dirt_cache.get(key)
-        if sprite is None:
-            sprite = pygame.transform.rotate(self.dirt[variant][shade], deg)
-            self._dirt_cache[key] = sprite
-        return sprite
-
-    def draw(self, screen: pygame.Surface, now: float):
-        screen.fill(BG_COLOUR)
-        vcol, vrow = self.visual_pos(now)
-        feet_wx, feet_top = tile_origin(vcol, vrow)
-        feet_wy = feet_top + TILE_H / 2
-        yaw = self.current_yaw(now)
-        cos_y = math.cos(yaw)
-        sin_y = math.sin(yaw)
-        # Feet stay just below centre so his body, not only his shoes, is centred.
-        origin_sx = WIN_W / 2
-        origin_sy = WIN_H / 2 + 46
-
-        def project(wx, wy, lift=0.0):
-            # Rotate the floor around his feet. Lift is applied afterwards so
-            # hedges and the gate stay upright on the screen instead of tipping
-            # over with the yaw.
-            dx = wx - feet_wx
-            dy = wy - feet_wy
-            rx = dx * cos_y - dy * sin_y
-            ry = dx * sin_y + dy * cos_y - lift
-            return origin_sx + rx, origin_sy + ry
-
-        margin = 110
+    def _visible_tiles(self, cam_x, cam_y):
+        margin_x = TILE_W + 8
+        margin_top = HEDGE_H + TILE_H
+        margin_bottom = TILE_H * 2
         tiles = []
         for row in range(MAZE_SIZE):
             for col in range(MAZE_SIZE):
                 wx, wy = tile_origin(col, row)
-                cx, cy = project(wx, wy + TILE_H / 2)
-                if cx < -margin or cx > WIN_W + margin or cy < -margin or cy > WIN_H + margin:
+                sx = wx - cam_x
+                sy = wy - cam_y
+                if sx < -margin_x or sx > WIN_W + margin_x:
                     continue
-                tiles.append((cy, col, row, cx))
-        tiles.sort(key=lambda item: (item[0], item[2], item[1]))
+                if sy > WIN_H + margin_bottom or sy < -margin_top:
+                    continue
+                tiles.append((float(row + col), col, row, int(round(sx)), int(round(sy))))
+        tiles.sort()
+        return tiles
 
-        bob = 0.0
+    def draw(self, screen: pygame.Surface, now: float):
+        screen.fill(BG_COLOUR)
+        vcol, vrow = self.visual_pos(now)
+        feet_x, feet_y = tile_origin(vcol, vrow)
+        feet_y += TILE_H // 2
+        # Feet sit near the centre; looking a little above them puts his body
+        # just above centre. The maze scrolls; tiles are not yaw-rotated.
+        cam_x = feet_x - WIN_W / 2
+        cam_y = (feet_y - 46) - WIN_H / 2
+        tiles = self._visible_tiles(cam_x, cam_y)
+
+        feet_sx = int(round(feet_x - cam_x))
+        feet_sy = int(round(feet_y - cam_y))
         if self.moving:
             t = (now - self.move_t0) / MOVE_MS
-            bob = math.sin(max(0.0, min(1.0, t)) * math.pi) * 3
-        # Walls first, then floors. A hedge face reaches into the cell in
-        # front of it; painting dirt afterwards keeps those tiles visible.
-        # Hedges nearer than Archie are drawn again so they can cover his feet.
-        for cy, col, row, cx in tiles:
-            if self.grid[row][col] == WALL:
-                self._draw_hedge(screen, col, row, project, cy)
+            feet_sy -= int(round(math.sin(max(0.0, min(1.0, t)) * math.pi) * 3))
+        # One pass, back to front. Archie slots in when tiles in front start.
+        char_depth = vrow + vcol
         drew = False
-        for cy, col, row, cx in tiles:
-            if not drew and cy > origin_sy + OCCLUDE_BIAS:
-                self._draw_archie(screen, origin_sx, origin_sy - bob, now)
+        for depth, col, row, tx, ty in tiles:
+            if not drew and depth > char_depth + 0.05:
+                self._draw_archie(screen, feet_sx, feet_sy, now)
                 drew = True
             cell = self.grid[row][col]
-            if cell == EXIT:
-                self._draw_exit(screen, col, row, project, cy)
-            elif cell != WALL:
-                self._draw_dirt(screen, col, row, cx, cy, yaw, project)
+            if cell == WALL:
+                self._draw_hedge(screen, col, row, tx, ty)
+            elif cell == EXIT:
+                self._draw_exit(screen, tx, ty)
+            else:
+                self._draw_dirt(screen, col, row, tx, ty)
         if not drew:
-            self._draw_archie(screen, origin_sx, origin_sy - bob, now)
-        for cy, col, row, cx in tiles:
-            if cy > origin_sy + OCCLUDE_BIAS and self.grid[row][col] == WALL:
-                self._draw_hedge(screen, col, row, project, cy)
+            self._draw_archie(screen, feet_sx, feet_sy, now)
         self._draw_minimap(screen)
         self._draw_hint(screen)
         if self.won:
             self._draw_win(screen)
 
-    def _fog(self, colour, sy: float):
+    def _fog(self, colour, sy: int):
         # Slight aerial perspective: tiles higher on the screen are a touch darker.
         k = 0.88 + 0.14 * max(0.0, min(1.0, sy / WIN_H))
         return mix(colour, k)
 
-    def _ipts(self, pts):
-        return [(int(round(x)), int(round(y))) for x, y in pts]
-
-    def _draw_dirt(self, screen, col, row, cx, cy, yaw, project):
+    def _draw_dirt(self, screen, col, row, tx: int, ty: int):
+        """Clipped dirt diamond in tile space. Not a rotated sprite."""
         variant = (col * 5 + row * 3 + (col ^ row)) % N_DIRT
+        cy = ty + TILE_H // 2
         if cy < WIN_H * 0.33:
             shade = 0
         elif cy < WIN_H * 0.66:
             shade = 1
         else:
             shade = 2
-        sprite = self._rotated_dirt(variant, shade, yaw)
+        sprite = self.dirt[variant][shade]
         screen.blit(
             sprite,
-            (
-                int(round(cx - sprite.get_width() / 2)),
-                int(round(cy - sprite.get_height() / 2)),
-            ),
+            (tx - sprite.get_width() // 2, cy - sprite.get_height() // 2),
         )
-        tx, ty = tile_origin(col, row)
-        edge = self._fog(DIRT_EDGE, cy)
-        pygame.draw.polygon(screen, edge, self._ipts(project(x, y) for x, y in diamond_points(tx, ty)), 1)
 
-    def _draw_hedge(self, screen, col, row, project, sy: float):
+    def _draw_hedge(self, screen, col: int, row: int, tx: int, ty: int):
         shift = ((col * 13 + row * 7) % 11) - 5
-        top_c = self._fog((40 + shift, 98 + shift, 42), sy)
-        left_c = self._fog((16 + shift // 3, 48 + shift // 3, 22), sy)
-        right_c = self._fog((26 + shift // 3, 70 + shift // 3, 30), sy)
-        tx, ty = tile_origin(col, row)
+        top = self._fog((40 + shift, 98 + shift, 42), ty)
+        left = self._fog((16 + shift // 3, 48 + shift // 3, 22), ty)
+        right = self._fog((26 + shift // 3, 70 + shift // 3, 30), ty)
         hw = TILE_W // 2
         hh = TILE_H // 2
-        ground_w = (
+        ground = (
             (tx, ty),
             (tx + hw, ty + hh),
             (tx, ty + TILE_H),
             (tx - hw, ty + hh),
         )
-        ground = [project(x, y) for x, y in ground_w]
-        raised = [project(x, y - HEDGE_H) for x, y in ground_w]
-        # Original front-left and front-right faces, rigidly rotated.
+        raised = tuple((x, y - HEDGE_H) for x, y in ground)
         left_face = (ground[3], ground[2], raised[2], raised[3])
         right_face = (ground[1], ground[2], raised[2], raised[1])
-        pygame.draw.polygon(screen, left_c, self._ipts(left_face))
-        pygame.draw.polygon(screen, right_c, self._ipts(right_face))
-        pygame.draw.polygon(screen, top_c, self._ipts(raised))
-        inset_w = (
-            (tx, ty + hh - int(hh * 0.62)),
-            (tx + int(hw * 0.62), ty + hh),
-            (tx, ty + hh + int(hh * 0.62)),
-            (tx - int(hw * 0.62), ty + hh),
+        pygame.draw.polygon(screen, left, left_face)
+        pygame.draw.polygon(screen, right, right_face)
+        pygame.draw.polygon(screen, top, raised)
+        cx, cy = tx, ty - HEDGE_H + TILE_H // 2
+        inset = (
+            (cx, cy - int(hh * 0.62)),
+            (cx + int(hw * 0.62), cy),
+            (cx, cy + int(hh * 0.62)),
+            (cx - int(hw * 0.62), cy),
         )
-        cushion = self._fog((56 + shift, 122 + shift, 50), sy)
-        pygame.draw.polygon(screen, cushion, self._ipts(project(x, y - HEDGE_H) for x, y in inset_w))
+        cushion = self._fog((56 + shift, 122 + shift, 50), ty)
+        pygame.draw.polygon(screen, cushion, inset)
         h = (col * 92821 + row * 68917 + 17) & 0xFFFFFFFF
-        fleck_cx, fleck_cy = tx, ty + hh
         for i in range(4):
             h = (h * 1664525 + 1013904223) & 0xFFFFFFFF
             u = ((h >> 8) % 100) / 100.0 - 0.5
@@ -684,58 +618,61 @@ class Game:
             if abs(u) * 2 + abs(v) * 2 > 0.85:
                 continue
             fleck = (96, 168, 86) if i % 2 == 0 else (40, 96, 44)
-            fx, fy = project(fleck_cx + u * hw, fleck_cy + v * hh - HEDGE_H)
-            pygame.draw.circle(screen, self._fog(fleck, sy), (int(round(fx)), int(round(fy))), 2)
-        outline = self._fog((16, 42, 22), sy)
-        pygame.draw.polygon(screen, outline, self._ipts(raised), 1)
-        pygame.draw.line(screen, outline, self._ipts((left_face[0],))[0], self._ipts((left_face[3],))[0], 1)
-        pygame.draw.line(screen, outline, self._ipts((right_face[0],))[0], self._ipts((right_face[3],))[0], 1)
+            pygame.draw.circle(
+                screen,
+                self._fog(fleck, ty),
+                (int(cx + u * hw), int(cy + v * hh)),
+                2,
+            )
+        outline = self._fog((16, 42, 22), ty)
+        pygame.draw.polygon(screen, outline, raised, 1)
+        pygame.draw.line(screen, outline, left_face[0], left_face[3], 1)
+        pygame.draw.line(screen, outline, right_face[0], right_face[3], 1)
 
-    def _draw_exit(self, screen, col, row, project, sy: float):
-        tx, ty = tile_origin(col, row)
-        stone = self._fog((214, 198, 150), sy)
-        stone_edge = self._fog((148, 112, 64), sy)
-        pts = [project(x, y) for x, y in diamond_points(tx, ty)]
-        pygame.draw.polygon(screen, stone, self._ipts(pts))
+    def _draw_exit(self, screen, tx: int, ty: int):
+        stone = self._fog((214, 198, 150), ty)
+        stone_edge = self._fog((148, 112, 64), ty)
+        pts = diamond_points(tx, ty)
+        pygame.draw.polygon(screen, stone, pts)
+        inner = (
+            (tx, ty + 5),
+            (tx + TILE_W // 2 - 8, ty + TILE_H // 2),
+            (tx, ty + TILE_H - 5),
+            (tx - TILE_W // 2 + 8, ty + TILE_H // 2),
+        )
+        pygame.draw.polygon(screen, self._fog((232, 214, 168), ty), inner)
+        pygame.draw.polygon(screen, stone_edge, pts, 1)
         hw = TILE_W // 2
         hh = TILE_H // 2
-        inner_w = (
-            (tx, ty + 5),
-            (tx + hw - 8, ty + hh),
-            (tx, ty + TILE_H - 5),
-            (tx - hw + 8, ty + hh),
-        )
-        pygame.draw.polygon(screen, self._fog((232, 214, 168), sy), self._ipts(project(x, y) for x, y in inner_w))
-        pygame.draw.polygon(screen, stone_edge, self._ipts(pts), 1)
-        left_w = (tx - hw // 2 + 2, ty + hh + 6)
-        right_w = (tx + hw // 2 - 2, ty + hh + 6)
+        left = (tx - hw // 2 + 2, ty + hh + 6)
+        right = (tx + hw // 2 - 2, ty + hh + 6)
         post_h = 52
-        post = self._fog((122, 74, 38), sy)
-        light = self._fog((214, 168, 86), sy)
-        feet = []
-        for x, y in (left_w, right_w):
-            bx, by = project(x, y)
-            feet.append((bx, by))
-            pygame.draw.line(screen, post, (int(round(bx)), int(round(by))), (int(round(bx)), int(round(by - post_h))), 5)
-            pygame.draw.line(screen, light, (int(round(bx - 1)), int(round(by - 4))), (int(round(bx - 1)), int(round(by - post_h + 2))), 1)
-        (lx, ly), (rx, ry) = feet
-        arch_top = ((lx + rx) / 2, ly - post_h - 16)
-        left_top = (lx, ly - post_h)
-        right_top = (rx, ry - post_h)
-        pygame.draw.lines(screen, light, False, self._ipts((left_top, arch_top, right_top)), 3)
+        post = (122, 74, 38)
+        light = (214, 168, 86)
+        for x, y in (left, right):
+            pygame.draw.line(screen, post, (x, y), (x, y - post_h), 5)
+            pygame.draw.line(screen, light, (x - 1, y - 4), (x - 1, y - post_h + 2), 1)
+        arch_top = ((left[0] + right[0]) // 2, left[1] - post_h - 16)
+        pygame.draw.lines(
+            screen,
+            light,
+            False,
+            [(left[0], left[1] - post_h), arch_top, (right[0], right[1] - post_h)],
+            3,
+        )
         pygame.draw.line(
             screen,
             post,
-            (int(round(lx)), int(round(ly - post_h + 2))),
-            (int(round(rx)), int(round(ry - post_h + 2))),
+            (left[0], left[1] - post_h + 2),
+            (right[0], right[1] - post_h + 2),
             2,
         )
 
-    def _draw_archie(self, screen, feet_sx: float, feet_sy: float, now: float):
+    def _draw_archie(self, screen, feet_sx: int, feet_sy: int, now: float):
         key = self.pose(now)
         sprite = self.sprites[key]
         ax, ay = self.anchors[key]
-        screen.blit(self.shadow, (int(round(feet_sx - self.shadow.get_width() / 2)), int(round(feet_sy - 6))))
+        screen.blit(self.shadow, (feet_sx - self.shadow.get_width() // 2, feet_sy - 6))
         screen.blit(sprite, (int(round(feet_sx - ax)), int(round(feet_sy - ay))))
 
     def _draw_minimap(self, screen):
