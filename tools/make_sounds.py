@@ -288,6 +288,155 @@ def make_cloak(rising: bool) -> np.ndarray:
     return fade(normalise(x, 0.7), 0.002, 0.06)
 
 
+def _circular_band(n, rng, fc, width_oct, tilt=0.0):
+    """Noise band-passed with an FFT (circular), so the result loops seamlessly."""
+    spec = np.fft.rfft(rng.standard_normal(n))
+    f = np.fft.rfftfreq(n, 1.0 / SR)
+    f[0] = 1e-3
+    octs = np.log2(f / fc)
+    shape = np.exp(-0.5 * (octs / width_oct) ** 2) * (f / fc) ** tilt
+    y = np.fft.irfft(spec * shape, n)
+    return y / (np.sqrt(np.mean(y ** 2)) or 1.0)
+
+
+def make_dalek_hum() -> np.ndarray:
+    """A 2 s seamless loop: a breathy glide whoosh over a low mechanical hum.
+
+    Everything repeats exactly every 2 s: the noise bands are filtered
+    circularly (FFT), and every tone and wobble has a whole number of cycles
+    in 2 s, so the end runs straight into the start with no seam or click.
+    """
+    rng = np.random.default_rng(77)
+    dur = 2.0
+    n = int(dur * SR)
+    t = np.arange(n) / SR
+
+    def lfo(cycles_per_loop, phase=0.0):
+        return np.sin(2 * np.pi * cycles_per_loop / dur * t + phase)
+
+    # Low mechanical hum: 75 Hz with harmonics, slight pitch wobble, soft-clipped.
+    f0 = 75.0
+    wob = 0.012 * lfo(3)  # ~1.5 Hz drift in phase, about +-1 Hz
+    hum = np.zeros(n)
+    for k, a in ((1, 1.0), (2, 0.55), (3, 0.32), (4, 0.18), (6, 0.08)):
+        hum += a * np.sin(2 * np.pi * f0 * k * t + k * 2 * np.pi * wob * 4)
+    hum = np.tanh(1.4 * hum / np.max(np.abs(hum)))
+    hum *= 0.85 + 0.15 * lfo(1, 0.4)  # gentle 0.5 Hz throb
+    hum /= np.sqrt(np.mean(hum ** 2))
+    # Glide whoosh: two noise bands that swell in turn, so the hiss seems to move.
+    low = _circular_band(n, rng, 520.0, 0.55)
+    high = _circular_band(n, rng, 1500.0, 0.6, tilt=-0.3)
+    air = _circular_band(n, rng, 3800.0, 0.5)
+    swell = 0.5 + 0.5 * lfo(1)  # 0.5 Hz, one swell per half loop pair
+    whoosh = (0.6 + 0.4 * swell) * low + (0.6 + 0.4 * (1 - swell)) * 0.7 * high
+    whoosh += 0.12 * (0.7 + 0.3 * lfo(2, 1.1)) * air
+    whoosh /= np.sqrt(np.mean(whoosh ** 2))
+    # Faint servo whine, tuned to a whole number of cycles per loop.
+    whine = np.sin(2 * np.pi * 330.0 * t + 0.4 * lfo(2)) * (0.5 + 0.5 * lfo(1, 2.0))
+    x = 0.55 * hum + 0.42 * whoosh + 0.05 * whine
+    x = x / np.sqrt(np.mean(x ** 2)) * 0.10  # about -20 dBFS RMS
+    return np.clip(x, -0.6, 0.6)
+
+
+def _swept_noise(n, rng, fc_of_t, width_oct):
+    """Noise through a band-pass whose centre moves with time (STFT masking)."""
+    win, hop = 1024, 256
+    w = np.hanning(win)
+    noise = rng.standard_normal(n + win)
+    out = np.zeros(n + win)
+    norm = np.zeros(n + win)
+    f = np.fft.rfftfreq(win, 1.0 / SR)
+    f[0] = 1e-3
+    for start in range(0, n, hop):
+        fc = fc_of_t((start + win / 2) / SR)
+        mask = np.exp(-0.5 * (np.log2(f / fc) / width_oct) ** 2)
+        frame = np.fft.irfft(np.fft.rfft(noise[start:start + win] * w) * mask, win)
+        out[start:start + win] += frame * w
+        norm[start:start + win] += w * w
+    return (out / np.maximum(norm, 1e-3))[:n]
+
+
+def _reverb(x, rng, seconds=1.3, decay=0.38, wet=0.32):
+    """Synthetic room: convolve with exponentially decaying, darkened noise."""
+    m = int(seconds * SR)
+    t = np.arange(m) / SR
+    ir = rng.standard_normal(m) * np.exp(-t / decay)
+    ir = onepole_lp(ir, 3500.0)
+    ir[0] = 0.0
+    ir /= np.sqrt(np.sum(ir ** 2))
+    size = 1 << int(np.ceil(np.log2(len(x) + m)))
+    tail = np.fft.irfft(np.fft.rfft(x, size) * np.fft.rfft(ir, size), size)[:len(x) + m]
+    dry = np.concatenate([x, np.zeros(m)])
+    return (1 - wet) * dry + wet * tail
+
+
+TARDIS_CYCLE_S = 1.0   # one wheeze-groan per second, matching the visual pulses
+TARDIS_CYCLES = 3
+
+
+def make_tardis_demat() -> np.ndarray:
+    """An original 'wheeze-groan' evocation (not a copy of any broadcast sound).
+
+    Three rising-and-falling grinding groans, one per second, each swelling as
+    the TARDIS fades on screen (loudest at 0.5, 1.5 and 2.5 s): narrow-band
+    noisy harmonics on a gliding pitch, a breathy wheeze band that sweeps with
+    it, ring-modulated metallic overtones, a synthetic reverb, and a soft
+    thud as it winks out at about 3.25 s.
+    """
+    rng = np.random.default_rng(1963)
+    body_s = TARDIS_CYCLES * TARDIS_CYCLE_S + 0.35
+    n = int(body_s * SR)
+    t = np.arange(n) / SR
+    cyc = t / TARDIS_CYCLE_S
+    ph = cyc % 1.0
+    k = np.minimum(np.floor(cyc), TARDIS_CYCLES - 1)
+    # Pitch: up then down each cycle (a slightly lopsided arch), sagging a
+    # little lower cycle by cycle; the last cycle droops away.
+    arch = np.sin(np.pi * np.clip(ph, 0, 1)) ** 1.3
+    f0 = 92.0 * (1.0 - 0.05 * k) * (1.0 + 0.75 * arch)
+    f0 = np.where(cyc >= TARDIS_CYCLES, 92.0 * 0.86 * (1 - 0.3 * np.clip(cyc - TARDIS_CYCLES, 0, 1)), f0)
+    f0 = onepole_lp(f0, 12.0)
+    # Loudness: a swell per cycle, peaking mid-cycle; the third one fades away.
+    swell = 0.25 + 0.75 * np.sin(np.pi * np.clip(ph, 0, 1)) ** 1.6
+    overall = np.where(cyc < TARDIS_CYCLES - 1, 1.0, np.clip(1.0 - 0.7 * (cyc - (TARDIS_CYCLES - 1)), 0.0, 1.0))
+    env = onepole_lp(swell * overall, 25.0)
+    env *= np.clip(t / 0.04, 0, 1)
+    # Grinding groan: harmonics of f0, each with a jittery narrow-band
+    # amplitude (low-passed noise), so it scrapes instead of singing.
+    groan = np.zeros(n)
+    phase = 2 * np.pi * np.cumsum(f0) / SR
+    for h in range(1, 15):
+        formant = np.exp(-0.5 * (np.log2(h * 92.0 * 1.4 / 800.0) / 0.8) ** 2) + 0.5 * np.exp(-0.5 * (np.log2(h * 92.0 * 1.4 / 2300.0) / 0.4) ** 2)
+        jitter = onepole_lp(rng.standard_normal(n), 60.0 + 10 * h)
+        jitter = 0.35 + jitter / (np.std(jitter) + 1e-9) * 0.65
+        groan += formant / h ** 0.35 * jitter * np.sin(h * phase + rng.uniform(0, 2 * np.pi))
+    groan = np.tanh(1.6 * groan / (np.std(groan) * 3))
+    # Breathy wheeze: a noise band sweeping with the pitch, strongest on the up-swing.
+    wheeze = _swept_noise(n, rng, lambda tt: 700.0 + 1500.0 * np.sin(np.pi * ((tt / TARDIS_CYCLE_S) % 1.0)) ** 1.3, 0.35)
+    wheeze *= 0.6 + 0.4 * np.clip(np.cos(np.pi * ph), 0, 1)
+    # Metallic overtones: the groan ring-modulated by two inharmonic carriers.
+    metal = groan * (0.6 * np.sin(2 * np.pi * 431.0 * t) + 0.4 * np.sin(2 * np.pi * 1117.0 * t))
+    metal = onepole_hp(metal, 400.0)
+    x = env * (0.62 * groan / (np.std(groan) + 1e-9)
+               + 0.30 * wheeze / (np.std(wheeze) + 1e-9)
+               + 0.22 * metal / (np.std(metal) + 1e-9))
+    x = onepole_lp(x, 4200.0)
+    x = onepole_hp(x, 45.0)
+    tail = int(0.15 * SR)
+    x[-tail:] *= np.linspace(1.0, 0.0, tail) ** 2  # the groan dies away, no hard stop
+    # Soft thud as it winks out.
+    td = TARDIS_CYCLES * TARDIS_CYCLE_S + 0.25
+    i0 = int(td * SR)
+    m = n - i0
+    tt = np.arange(m) / SR
+    thud = (np.sin(2 * np.pi * (70.0 - 25.0 * tt / 0.35) * tt) * np.exp(-tt / 0.07)
+            + 0.3 * onepole_lp(rng.standard_normal(m), 300.0) * np.exp(-tt / 0.04))
+    x[i0:] += 0.9 * thud * np.clip(tt / 0.008, 0, 1)
+    x = _reverb(x / np.max(np.abs(x)), rng)
+    x = fade(x, 0.004, 0.25)
+    return normalise(x, 0.85)
+
+
 SOUNDS = {
     "exterminate": make_exterminate,
     "laser": make_laser,
@@ -298,6 +447,8 @@ SOUNDS = {
     "rustle": make_rustle,
     "cloak_on": lambda: make_cloak(True),
     "cloak_off": lambda: make_cloak(False),
+    "dalek_hum": make_dalek_hum,
+    "tardis_demat": make_tardis_demat,
 }
 
 
@@ -353,9 +504,14 @@ def main():
         write_wav(path, x)
         rms = float(np.sqrt(np.mean(x ** 2)))
         print(f"{name:12s} {len(x) / SR:5.2f} s  peak {np.max(np.abs(x)):.2f}  rms {rms:.3f}  -> {os.path.relpath(path)}")
-        if args.spectrograms and name in ("exterminate", "laser", "ow", "cloak_on", "cloak_off", "rustle"):
+        if args.spectrograms and name in ("exterminate", "laser", "ow", "cloak_on", "cloak_off", "rustle", "tardis_demat"):
             os.makedirs(args.spectrograms, exist_ok=True)
             spectrogram_png(x, os.path.join(args.spectrograms, f"spec_{name}.png"), name)
+        if args.spectrograms and name == "dalek_hum":
+            # The loop played twice, so the seam at 2.00 s can be checked by eye.
+            os.makedirs(args.spectrograms, exist_ok=True)
+            spectrogram_png(np.concatenate([x, x]), os.path.join(args.spectrograms, "spec_dalek_hum.png"),
+                            "dalek_hum, looped twice (seam at 2.00 s)")
 
 
 if __name__ == "__main__":

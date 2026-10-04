@@ -105,6 +105,12 @@ DISGUISE_SCALE = 0.86
 DALEK_GUN_SRC = {"se": (95, 76), "ne": (103, 47)}
 DALEK_EYE_SRC = {"se": (79, 30), "ne": (77, 5)}
 DALEK_SPACING = (12, 10, 8, 6, 4, 2)  # wanted gap between Daleks, relaxed in turn
+# The TARDIS that dropped Archie off dematerialises behind him at the start.
+DEMAT_MS = 3600              # whole effect; the box is gone by about 3.3 s
+DEMAT_PULSE_MS = 1000        # one fade pulse (and one wheeze-groan) per second
+DEMAT_BACK = 0.32            # cells behind Archie's start spot, so he stands in front
+DEMAT_LEVELS = 24            # pre-faded copies of the TARDIS (no set_alpha on RGBA)
+TARDIS_LAMP_SRC = (59, 11)   # roof lamp in the 119x200 source image
 DISGUISE_KEYS = (pygame.K_h, pygame.K_LSHIFT, pygame.K_RSHIFT)
 MUTE_KEY = pygame.K_m
 
@@ -118,11 +124,13 @@ SOUND_FILES = {
     "step2": "step2.wav",
     "step3": "step3.wav",
 }
-SOUND_FILES.update({"rustle": "rustle.wav", "cloak_on": "cloak_on.wav", "cloak_off": "cloak_off.wav"})
+SOUND_FILES.update({"rustle": "rustle.wav", "cloak_on": "cloak_on.wav", "cloak_off": "cloak_off.wav",
+                    "tardis_demat": "tardis_demat.wav"})
 SOUND_VOLUME = {
     "ow": 0.38, "exterminate": 0.9, "laser": 0.7,
     "step1": 0.45, "step2": 0.45, "step3": 0.45,
     "rustle": 0.30, "cloak_on": 0.5, "cloak_off": 0.5,
+    "tardis_demat": 0.6,
 }
 STEP_SOUNDS = ("step1", "step2", "step3")
 OW_BUMPS = 3                 # "ow" on the 3rd hedge bump ...
@@ -130,6 +138,18 @@ OW_WINDOW_MS = 2000          # ... within 2 s; single bumps only rustle
 OW_QUIET_MS = 2000           # after an "ow", bumps just rustle for a while
 BUMP_COUNT_GAP_MS = 250      # held-key repeats count, but at most 4 a second
 RUSTLE_GAP_MS = 450          # the soft rustle at most about twice a second
+# Dalek proximity hum: one looping channel per Dalek, reserved so effects
+# never steal it. Loud only when a Dalek is gliding close by; it fades out
+# while the Dalek turns or stands still (aiming, firing, blocked).
+HUM_FILE = "dalek_hum.wav"
+HUM_MAX = 0.28               # channel volume when a Dalek is right next to Archie
+HUM_FAR = 9.0                # silent at this effective distance (cells) ...
+HUM_NEAR = 1.0               # ... full volume at this one or closer
+HUM_PATH_WEIGHT = 0.65       # effective distance = 65% maze path + 35% straight line
+HUM_FADE_OUT_MS = 80         # quick fade when a Dalek stops to turn (pause is 160 ms)
+HUM_FADE_IN_MS = 110         # and back up as it glides off again
+HUM_DIST_SMOOTH_MS = 100     # distance changes are smoothed too
+HUM_PAN = 0.45               # subtle stereo: at most 45% off the far side
 MIXER_FREQ = 22050
 MIXER_BUFFER = 512           # ~23 ms at 22050 Hz: small, so sounds aren't laggy
 RESTART_KEYS = (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_r, pygame.K_SPACE)
@@ -682,6 +702,9 @@ class Sounds:
         self.played = {}
         self.last_step = None
         self._rng = random.Random(4)
+        self.hum = None
+        self.hum_channels = []
+        self.hum_levels = [(0.0, 0.0)] * NUM_DALEKS  # last (left, right) asked for
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(MIXER_FREQ, -16, 2, MIXER_BUFFER)
@@ -692,8 +715,14 @@ class Sounds:
             return
         try:
             pygame.mixer.set_num_channels(16)
+            pygame.mixer.set_reserved(NUM_DALEKS)
+            self.hum_channels = [pygame.mixer.Channel(i) for i in range(NUM_DALEKS)]
         except Exception:
-            pass
+            self.hum_channels = []
+        try:
+            self.hum = pygame.mixer.Sound(os.path.join(SOUND_DIR, HUM_FILE))
+        except Exception:
+            self.hum = None
         for name, filename in SOUND_FILES.items():
             try:
                 snd = pygame.mixer.Sound(os.path.join(SOUND_DIR, filename))
@@ -729,7 +758,39 @@ class Sounds:
         self.last_step = self._rng.choice(choices)
         return self.play(self.last_step)
 
+    def set_hum(self, i: int, left: float, right: float, keep: bool):
+        """Volume of Dalek i's looping hum. Stops the loop when it is silent
+        and not wanted soon (far away, dead, won, muted)."""
+        if self.muted:
+            left = right = 0.0
+            keep = False
+        if i < len(self.hum_levels):
+            self.hum_levels[i] = (left, right)
+        if not self.ok or self.hum is None or i >= len(self.hum_channels):
+            return
+        ch = self.hum_channels[i]
+        try:
+            if left <= 0.0 and right <= 0.0 and not keep:
+                if ch.get_busy():
+                    ch.stop()
+                return
+            if not ch.get_busy():
+                ch.set_volume(0.0, 0.0)
+                ch.play(self.hum, loops=-1)
+            ch.set_volume(left, right)
+        except Exception:
+            pass
+
+    def stop_hums(self):
+        self.hum_levels = [(0.0, 0.0)] * NUM_DALEKS
+        for ch in self.hum_channels:
+            try:
+                ch.stop()
+            except Exception:
+                pass
+
     def stop_all(self):
+        self.hum_levels = [(0.0, 0.0)] * NUM_DALEKS
         if not self.ok:
             return
         try:
@@ -759,9 +820,15 @@ class Dalek:
         self.fire_t0 = 0.0
         self.rng = rng
         self.feet = (0, 0)  # view-space feet, set while drawing
+        self.glide = 0.0     # hum fade, 0..1: up while gliding, down when it stops
+        self.near = 0.0      # smoothed closeness, 0..1
+        self.hum_dist = 99.0  # effective distance used for the hum (cells)
 
     def cell(self):
         return int(round(self.pos[0])), int(round(self.pos[1]))
+
+    def gliding(self, now: float) -> bool:
+        return self.state == "roam" and now >= self.wait_until
 
     def face(self, direction, now: float) -> bool:
         if direction == self.facing:
@@ -812,12 +879,24 @@ class Game:
                     gx, ex = sw - 1 - gx, sw - 1 - ex
                 self.dalek_gun[name] = ((gx + 0.5) * k, (gy + 0.5) * k)
                 self.dalek_eye[name] = ((ex + 0.5) * k, (ey + 0.5) * k)
-        _src, self.tardis, _k = _load_scaled(TARDIS_FILE, TARDIS_H)
+        _src, self.tardis, tk = _load_scaled(TARDIS_FILE, TARDIS_H)
         self.tardis_anchor = _base_anchor(self.tardis)
+        self.tardis_lamp = ((TARDIS_LAMP_SRC[0] + 0.5) * tk, (TARDIS_LAMP_SRC[1] + 0.5) * tk)
         self.dalek_shadow = pygame.Surface((50, 18), pygame.SRCALPHA)
         pygame.draw.ellipse(self.dalek_shadow, (30, 20, 10, 120), self.dalek_shadow.get_rect())
         self.tardis_shadow = pygame.Surface((76, 30), pygame.SRCALPHA)
         pygame.draw.ellipse(self.tardis_shadow, (24, 16, 8, 110), self.tardis_shadow.get_rect())
+        # Dematerialisation: pre-faded TARDIS and shadow (alpha copied exactly,
+        # scaled with numpy) and a lamp glow at a few brightness levels.
+        self.demat_fades = [_alpha_scaled(self.tardis, i / (DEMAT_LEVELS - 1)) for i in range(DEMAT_LEVELS)]
+        self.demat_shadows = [_alpha_scaled(self.tardis_shadow, i / (DEMAT_LEVELS - 1)) for i in range(DEMAT_LEVELS)]
+        lamp = _make_glow(11, (255, 236, 190))
+        self.demat_lamps = []
+        for i in range(12):
+            g = lamp.copy()
+            v = int(255 * i / 11)
+            g.fill((v, v, v), special_flags=pygame.BLEND_RGB_MULT)  # opaque surface: safe
+            self.demat_lamps.append(g)
         self.scorch = pygame.Surface((34, 14), pygame.SRCALPHA)
         pygame.draw.ellipse(self.scorch, (20, 12, 6, 170), self.scorch.get_rect())
         pygame.draw.ellipse(self.scorch, (10, 6, 4, 200), self.scorch.get_rect().inflate(-14, -6))
@@ -891,7 +970,12 @@ class Game:
         self.cooldown_until = 0.0
         self.disguise_pending = False
         self.exit_cell = (MAZE_SIZE - 2, MAZE_SIZE - 2)
+        self.demat_t0 = None  # set on the first update, which also plays the sound
+        self.demat_cell = (1, 1)
+        self.demat_back = (-DIR_ORDER[0][0], -DIR_ORDER[0][1])  # behind his start facing
         self.daleks = []
+        self._hum_from = None
+        self._hum_dist = {}
         self._spawn_daleks()
 
     # ----- Daleks -------------------------------------------------------
@@ -1146,6 +1230,12 @@ class Game:
     def setup_scene(self, name: str, now: float = 0.0) -> float:
         """Arrange a scene and return how long (ms) to simulate before the shot."""
         self.last_now = now
+        if name == "tardis_demat":
+            # The start of a game: Archie on his start cell, the TARDIS behind him.
+            self._park_other_daleks(None)
+            self.demat_t0 = now
+            self.sfx.play("tardis_demat")
+            return 1500.0
         if name == "tardis":
             # Three path cells back from the TARDIS, facing along the way to it.
             dist = self._path_dist(self.exit_cell)
@@ -1358,6 +1448,9 @@ class Game:
     def update(self, now: float):
         dt = 0.0 if self.last_now is None else max(0.0, min(100.0, now - self.last_now))
         self.last_now = now
+        if self.demat_t0 is None:
+            self.demat_t0 = now
+            self.sfx.play("tardis_demat")
         if self.disguised and now - self.disguise_t0 >= DISGUISE_MS:
             self._end_disguise(now)
         if not self.dead:
@@ -1367,6 +1460,58 @@ class Game:
             if now >= self.cooldown_until:
                 self._start_disguise(now)
         self._update_daleks(now, dt)
+        self._update_hum(now, dt)
+
+    # ----- Dalek proximity hum -------------------------------------------
+    def _hum_distance(self, d: Dalek, archie_pos) -> float:
+        """Blend of path distance through the maze (hedges block sound) and
+        straight-line distance, in cells, from Archie to Dalek d."""
+        here = (self.col, self.row)
+        if self._hum_from != here:
+            self._hum_from = here
+            self._hum_dist = self._path_dist(here)
+        straight = math.hypot(d.pos[0] - archie_pos[0], d.pos[1] - archie_pos[1])
+        tx, ty = d.target
+        dx, dy = tx - d.pos[0], ty - d.pos[1]
+        frac = min(1.0, abs(dx) + abs(dy))  # how far it still has to go to its target
+        to_t = self._hum_dist.get(d.target)
+        src = (tx - int(math.copysign(1, dx)) if abs(dx) > 1e-6 else tx,
+               ty - int(math.copysign(1, dy)) if abs(dy) > 1e-6 else ty)
+        from_s = self._hum_dist.get(src, to_t) if frac > 1e-6 else to_t
+        if to_t is None:
+            to_t = from_s
+        if to_t is None:
+            path = straight * 3.0  # not reachable (should not happen in a perfect maze)
+        else:
+            path = to_t * (1.0 - frac) + from_s * frac
+        return HUM_PATH_WEIGHT * path + (1.0 - HUM_PATH_WEIGHT) * straight
+
+    def _update_hum(self, now: float, dt: float):
+        active = not (self.dead or self.won or self.sfx.muted)
+        k = 1.0 - math.exp(-dt / HUM_DIST_SMOOTH_MS) if dt > 0 else 1.0
+        archie_pos = self.visual_pos(now)
+        ax, ay = tile_origin(*archie_pos)
+        for i, d in enumerate(self.daleks):
+            dist = self._hum_distance(d, archie_pos)
+            d.hum_dist = dist
+            u = max(0.0, min(1.0, (HUM_FAR - dist) / (HUM_FAR - HUM_NEAR)))
+            d.near += (u * u - d.near) * k
+            if not active:
+                d.glide = 0.0 if self.sfx.muted else max(0.0, d.glide - dt / HUM_FADE_OUT_MS)
+            elif d.gliding(now):
+                d.glide = min(1.0, d.glide + dt / HUM_FADE_IN_MS)
+            else:
+                d.glide = max(0.0, d.glide - dt / HUM_FADE_OUT_MS)
+            vol = HUM_MAX * d.near * d.glide
+            if vol < 0.002:
+                vol = 0.0
+            # Subtle stereo from where the Dalek is on screen, left or right of Archie.
+            dx, _ = tile_origin(d.pos[0], d.pos[1])
+            pan = max(-1.0, min(1.0, (dx - ax) / (self.view_w / 2))) * HUM_PAN
+            left = vol * (1.0 - max(0.0, pan))
+            right = vol * (1.0 + min(0.0, pan))
+            keep = active and dist < HUM_FAR + 2.0
+            self.sfx.set_hum(i, left, right, keep)
 
     def _update_archie(self, now: float):
         if self.turning:
@@ -1481,6 +1626,11 @@ class Game:
             entities.append((d.pos[0] + d.pos[1], 0, lambda d=d: self._draw_dalek(screen, d, now, cam_x, cam_y)))
         ec, er = self.exit_cell
         entities.append((float(ec + er), 2, lambda: self._draw_tardis(screen, cam_x, cam_y)))
+        if self.demat_t0 is None or now - self.demat_t0 < DEMAT_MS:
+            dc, dr = self.demat_cell
+            # Drawn just before Archie when he is on the start cell (same depth,
+            # lower priority), so he always stands in front of it.
+            entities.append((float(dc + dr), 0.5, lambda: self._draw_demat(screen, now, cam_x, cam_y)))
         entities.sort(key=lambda e: (e[0], e[1]))
         k = 0
         for depth, col, row, tx, ty in tiles:
@@ -1537,6 +1687,52 @@ class Game:
         sh = self.tardis_shadow
         screen.blit(sh, (int(fx - sh.get_width() / 2), int(fy - sh.get_height() / 2 + 2)))
         screen.blit(img, (int(round(fx - ax)), int(round(fy - ay))))
+
+    def demat_alpha(self, now: float):
+        """(TARDIS opacity, lamp brightness), both 0..1, during the dematerialisation.
+
+        Classic fade pulsing: one pulse per second (solid at 0, 1, 2 s, faintest
+        at 0.5, 1.5, 2.5 s, as each wheeze-groan swells) inside an overall fade
+        that reaches nothing at about 3.3 s. The roof lamp flashes throughout.
+        """
+        if self.demat_t0 is None:
+            return 1.0, 0.0
+        t = now - self.demat_t0
+        if t < 0 or t >= DEMAT_MS:
+            return 0.0, 0.0
+        u = min(1.0, t / 3300.0)
+        overall = 1.0 - u * u * (3.0 - 2.0 * u)
+        pulse = 0.12 + 0.88 * (0.5 + 0.5 * math.cos(2 * math.pi * t / DEMAT_PULSE_MS)) ** 1.5
+        alpha = overall * pulse
+        flash = (0.5 + 0.5 * math.cos(2 * math.pi * t / 500.0)) ** 2
+        lamp = flash * min(1.0, 0.25 + 1.2 * overall) * (1.0 if t < 3300 else 0.0)
+        return alpha, lamp
+
+    def _draw_demat(self, screen, now: float, cam_x: float, cam_y: float):
+        alpha, lamp = self.demat_alpha(now)
+        if alpha <= 0.0 and lamp <= 0.0:
+            return
+        dc, dr = self.demat_cell
+        bc, br = self.demat_back
+        fx, fy = tile_origin(dc + bc * DEMAT_BACK, dr + br * DEMAT_BACK)
+        fx -= cam_x
+        fy += TILE_H // 2 - cam_y
+        img_w, img_h = self.tardis.get_size()
+        if fx < -img_w or fx > self.view_w + img_w or fy < -40 or fy > self.view_h + img_h:
+            return
+        level = int(round(alpha * (DEMAT_LEVELS - 1)))
+        ax, ay = self.tardis_anchor
+        if level > 0:
+            sh = self.demat_shadows[level]
+            screen.blit(sh, (int(fx - sh.get_width() / 2), int(fy - sh.get_height() / 2 + 2)))
+            screen.blit(self.demat_fades[level], (int(round(fx - ax)), int(round(fy - ay))))
+        li = int(round(lamp * 11))
+        if li > 0:
+            g = self.demat_lamps[li]
+            lx = fx - ax + self.tardis_lamp[0]
+            ly = fy - ay + self.tardis_lamp[1]
+            screen.blit(g, (int(lx - g.get_width() / 2), int(ly - g.get_height() / 2)),
+                        special_flags=pygame.BLEND_RGB_ADD)
 
     def _draw_dalek(self, screen, d: Dalek, now: float, cam_x: float, cam_y: float):
         fx, fy = tile_origin(d.pos[0], d.pos[1])
@@ -1801,7 +1997,7 @@ def parse_args(argv):
     parser.add_argument("--seed", type=int, default=None, help="maze seed (default: time)")
     parser.add_argument("--screenshot", type=str, default=None, help="save a frame to this path and quit")
     parser.add_argument("--frames", type=int, default=None, help="after the first frame, simulate N movement frames")
-    parser.add_argument("--scene", choices=("dalek", "laser", "telegraph", "disguise", "tardis"), default=None,
+    parser.add_argument("--scene", choices=("dalek", "laser", "telegraph", "disguise", "tardis", "tardis_demat"), default=None,
                         help="debug: arrange a scene, simulate it briefly, then screenshot")
     parser.add_argument("--scene-ms", type=float, default=None, help="debug: override the scene's simulated time")
     return parser.parse_args(argv)
