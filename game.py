@@ -295,6 +295,246 @@ def build_dirt_variants(texture: pygame.Surface):
     return variants
 
 
+N_HEDGE = 16
+N_HEDGE_SHADES = 8
+HEDGE_FOG_LO = 0.88  # same range as Game._fog
+HEDGE_FOG_HI = 1.02
+HEDGE_PAD_X = 6
+HEDGE_PAD_TOP = 9
+HEDGE_PAD_BOT = 4
+HEDGE_SW = TILE_W + 2 * HEDGE_PAD_X
+HEDGE_SH = HEDGE_PAD_TOP + HEDGE_H + TILE_H + HEDGE_PAD_BOT
+HEDGE_OX = HEDGE_PAD_X + TILE_W // 2          # sprite x of the tile's top vertex
+HEDGE_OY = HEDGE_PAD_TOP + HEDGE_H            # sprite y of the tile's top vertex
+_SIDE = 32.0                                   # world units along one tile edge
+
+# View-space normals (x right, y down, z toward the viewer) and the light.
+_N_TOP = np.array([0.0, -0.866, 0.5])
+_N_LEFT = np.array([-0.707, 0.354, 0.612])
+_N_RIGHT = np.array([0.707, 0.354, 0.612])
+_LIGHT = np.array([0.38, -0.72, 0.58])
+_LIGHT = _LIGHT / np.linalg.norm(_LIGHT)
+
+
+def _project(u, v, w):
+    sx = HEDGE_OX + (u - v) * (TILE_W / 2) / _SIDE
+    sy = HEDGE_OY + (u + v) * (TILE_H / 2) / _SIDE - w
+    depth = 0.866 * (u + v) + 0.577 * w
+    return sx, sy, depth
+
+
+def _mounds(rng, count, amp):
+    cu = rng.uniform(-4, _SIDE + 4, count)
+    cv = rng.uniform(-4, _SIDE + 4, count)
+    sig = rng.uniform(5.0, 10.0, count)
+    a = rng.uniform(-0.4, 1.0, count) * amp
+
+    def field(u, v):
+        out = np.zeros_like(u)
+        for i in range(count):
+            out += a[i] * np.exp(-((u - cu[i]) ** 2 + (v - cv[i]) ** 2) / (2 * sig[i] ** 2))
+        return out
+    return field
+
+
+def render_hedge_variant(index: int, seed: int = 4242) -> np.ndarray:
+    """One leafy box-hedge block as an RGBA array (H, W, 4)."""
+    rng = np.random.default_rng(seed + index * 7919)
+    W, H = HEDGE_SW, HEDGE_SH
+    # Per-variant tint: hue leans yellow or blue, brightness wobbles.
+    warm = rng.uniform(-0.55, 0.55)
+    bright = rng.uniform(0.955, 1.045)
+    leaf_dark = np.array([34, 74, 30], dtype=np.float64)
+    leaf_light = np.array([112, 166, 66], dtype=np.float64)
+    leaf_dark += np.array([6, 2, -4]) * warm
+    leaf_light += np.array([16, 6, -10]) * warm
+    leaf_dark *= bright
+    leaf_light *= bright
+
+    top_bump = _mounds(rng, 5, 3.2)
+    left_bump = _mounds(rng, 4, 1.8)
+    right_bump = _mounds(rng, 4, 1.8)
+
+    leaves = []  # (u, v, w, face, offset)
+
+    def add(face, n):
+        o = rng.uniform(-2.8, 1.6, n)
+        if face == 0:     # top: plane w = HEDGE_H
+            u = rng.uniform(-1.2, _SIDE + 1.2, n)
+            v = rng.uniform(-1.2, _SIDE + 1.2, n)
+            w = HEDGE_H + top_bump(u, v) + o
+        elif face == 1:   # left (SW) face: plane v = SIDE
+            u = rng.uniform(-0.8, _SIDE + 0.8, n)
+            w = rng.uniform(-1.0, HEDGE_H + 0.5, n)
+            v = _SIDE + left_bump(u, w) * 0.7 + o * 0.8
+        else:             # right (SE) face: plane u = SIDE
+            v = rng.uniform(-0.8, _SIDE + 0.8, n)
+            w = rng.uniform(-1.0, HEDGE_H + 0.5, n)
+            u = _SIDE + right_bump(v, w) * 0.7 + o * 0.8
+        leaves.append((u, v, w, np.full(n, face), o))
+
+    add(0, 330)
+    add(1, 430)
+    add(2, 430)
+    u = np.concatenate([l[0] for l in leaves])
+    v = np.concatenate([l[1] for l in leaves])
+    w = np.concatenate([l[2] for l in leaves])
+    face = np.concatenate([l[3] for l in leaves])
+    off = np.concatenate([l[4] for l in leaves])
+    n = u.size
+    sx, sy, depth = _project(u, v, w)
+
+    # Leaf ellipse shape.
+    a = rng.uniform(1.7, 3.1, n)
+    b = a * rng.uniform(0.45, 0.75, n)
+    th = rng.uniform(0, math.pi, n)
+    # Leaves on the side faces hang a little more vertically.
+    side = face > 0
+    th[side] = rng.normal(math.pi / 2, 0.6, side.sum())
+    ct, st = np.cos(th), np.sin(th)
+
+    R = 4
+    dy, dx = np.mgrid[-R:R + 1, -R:R + 1]
+    dx = dx.ravel()[None, :]
+    dy = dy.ravel()[None, :]
+    ix = np.floor(sx)[:, None].astype(np.int64) + dx
+    iy = np.floor(sy)[:, None].astype(np.int64) + dy
+    px = ix + 0.5 - sx[:, None]
+    py = iy + 0.5 - sy[:, None]
+    lx = px * ct[:, None] + py * st[:, None]
+    ly = -px * st[:, None] + py * ct[:, None]
+    d2 = (lx / a[:, None]) ** 2 + (ly / b[:, None]) ** 2
+    inside = (d2 < 1.0) & (ix >= 0) & (ix < W) & (iy >= 0) & (iy < H)
+    hz = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
+    # Ellipsoid normal in leaf space, rotated back to screen.
+    gx = lx / a[:, None] ** 2
+    gy = ly / b[:, None] ** 2
+    nx = gx * ct[:, None] - gy * st[:, None]
+    ny = gx * st[:, None] + gy * ct[:, None]
+    nz = hz / b[:, None]
+    face_n = np.stack([_N_TOP, _N_LEFT, _N_RIGHT])[face]          # (n, 3)
+    nnorm = np.sqrt(nx * nx + ny * ny + nz * nz) + 1e-9
+    k_leaf = 0.75
+    Nx = face_n[:, 0:1] + k_leaf * nx / nnorm
+    Ny = face_n[:, 1:2] + k_leaf * ny / nnorm
+    Nz = face_n[:, 2:3] + k_leaf * nz / nnorm
+    L = np.sqrt(Nx * Nx + Ny * Ny + Nz * Nz)
+    ndl = (Nx * _LIGHT[0] + Ny * _LIGHT[1] + Nz * _LIGHT[2]) / L
+    shade = 0.30 + 0.80 * np.clip(ndl, 0.0, 1.0)
+    # Rim: the middle of each leaf a touch brighter, its edge darker.
+    shade *= 0.80 + 0.20 * hz
+
+    # Leaf colour.
+    t = np.clip(rng.beta(2.2, 2.0, n), 0, 1)
+    face_gain = np.where(face == 0, 1.04, np.where(face == 1, 0.70, 0.84))
+    ao = 0.55 + 0.45 * np.clip((off + 2.8) / 4.4, 0, 1)
+    ground = np.where(face > 0, 0.55 + 0.45 * np.clip(w / 16.0, 0, 1), 1.0)
+    jitter = rng.uniform(0.9, 1.1, n)
+    base = leaf_dark[None, :] * (1 - t[:, None]) + leaf_light[None, :] * t[:, None]
+    # A few young, yellow-green leaves on top.
+    young = (face == 0) & (rng.random(n) < 0.08)
+    base[young] = base[young] * 0.6 + np.array([170, 196, 92]) * 0.4
+    gain = (face_gain * ao * ground * jitter)[:, None] * shade
+    cr = base[:, 0:1] * gain
+    cg = base[:, 1:2] * gain
+    cb = base[:, 2:3] * gain
+    zd = depth[:, None] + hz * b[:, None] * 0.9
+
+    # Resolve with a z-buffer: sort by depth, last write wins.
+    m = inside.ravel()
+    flat = (iy * W + ix).ravel()[m]
+    zz = np.broadcast_to(zd, inside.shape).ravel()[m]
+    rgb = np.stack([cr.ravel()[m], cg.ravel()[m], cb.ravel()[m]], axis=1)
+    order = np.lexsort((zz, flat))
+    flat_s = flat[order]
+    last = np.ones(flat_s.size, dtype=bool)
+    last[:-1] = flat_s[1:] != flat_s[:-1]
+    pick = order[last]
+
+    img = np.zeros((H * W, 4), dtype=np.float64)
+    # Base: the dark interior of the hedge so gaps read as deep shade.
+    yy, xx = np.mgrid[0:H, 0:W]
+    xr = xx + 0.5 - HEDGE_OX
+    yr = yy + 0.5 - HEDGE_OY
+    # top plane
+    su = (xr + 2 * (yr + HEDGE_H)) * _SIDE / TILE_W * 1.0
+    sv = (-xr + 2 * (yr + HEDGE_H)) * _SIDE / TILE_W * 1.0
+    top_in = (su >= 0) & (su <= _SIDE) & (sv >= 0) & (sv <= _SIDE)
+    # left face v = SIDE: x = (u - SIDE) * 32/SIDE
+    lu = xr * _SIDE / (TILE_W / 2) + _SIDE
+    lw = (lu + _SIDE) * (TILE_H / 2) / _SIDE - yr
+    left_in = (lu >= 0) & (lu <= _SIDE) & (lw >= 0) & (lw <= HEDGE_H)
+    rv = _SIDE - xr * _SIDE / (TILE_W / 2)
+    rw = (_SIDE + rv) * (TILE_H / 2) / _SIDE - yr
+    right_in = (rv >= 0) & (rv <= _SIDE) & (rw >= 0) & (rw <= HEDGE_H)
+    under = np.zeros((H, W, 3))
+    under[left_in] = leaf_dark * 0.30
+    under[right_in] = leaf_dark * 0.42
+    under[top_in] = leaf_dark * 0.55
+    base_mask = (top_in | left_in | right_in).ravel()
+    img[base_mask, :3] = under.reshape(-1, 3)[base_mask]
+    img[base_mask, 3] = 255
+    img[flat[pick], 0] = rgb[pick, 0]
+    img[flat[pick], 1] = rgb[pick, 1]
+    img[flat[pick], 2] = rgb[pick, 2]
+    img[flat[pick], 3] = 255
+    return np.clip(img, 0, 255).astype(np.uint8).reshape(H, W, 4)
+
+
+def _rgba_surface(arr):
+    H, W, _ = arr.shape
+    surf = pygame.Surface((W, H), pygame.SRCALPHA)
+    pygame.surfarray.pixels3d(surf)[:] = np.transpose(arr[..., :3], (1, 0, 2))
+    pygame.surfarray.pixels_alpha(surf)[:] = arr[..., 3].T
+    return surf
+
+
+def build_hedge_variants():
+    """Pre-render the leafy hedge blocks, each in a few fog shades.
+
+    Returns variants[v][shade] surfaces, blitted with the tile's top vertex
+    at (HEDGE_OX, HEDGE_OY). Footprint and height match the old flat block.
+    """
+    variants = []
+    levels = np.linspace(HEDGE_FOG_LO, HEDGE_FOG_HI, N_HEDGE_SHADES)
+    for i in range(N_HEDGE):
+        arr = render_hedge_variant(i)
+        shades = []
+        for k in levels:
+            shaded = arr.copy()
+            shaded[..., :3] = np.clip(arr[..., :3].astype(np.float32) * k, 0, 255).astype(np.uint8)
+            shades.append(_rgba_surface(shaded).convert_alpha())
+        variants.append(shades)
+    return variants
+
+
+def hedge_variant_grid(grid, seed: int):
+    """Deterministic variant per hedge cell from a hash of (col, row, seed).
+
+    A cell never repeats the variant of any already-chosen neighbour
+    (W, N, NW, NE), so no two touching hedges are the same block.
+    """
+    size = len(grid)
+    out = [[-1] * size for _ in range(size)]
+    for row in range(size):
+        for col in range(size):
+            if grid[row][col] != WALL:
+                continue
+            h = (col * 73856093) ^ (row * 19349663) ^ (seed * 83492791)
+            h = (h ^ (h >> 13)) * 0x5BD1E995 & 0xFFFFFFFF
+            h ^= h >> 15
+            v = h % N_HEDGE
+            taken = set()
+            for dc, dr in ((-1, 0), (0, -1), (-1, -1), (1, -1), (-2, 0), (0, -2)):
+                c, r = col + dc, row + dr
+                if 0 <= c < size and 0 <= r < size:
+                    taken.add(out[r][c])
+            while v in taken:
+                v = (v + 7) % N_HEDGE
+            out[row][col] = v
+    return out
+
+
 class Game:
     def __init__(self, seed: int | None):
         self.sprites = {}
@@ -310,6 +550,7 @@ class Game:
         self.shadow = pygame.Surface((40, 16), pygame.SRCALPHA)
         pygame.draw.ellipse(self.shadow, (48, 30, 16, 110), self.shadow.get_rect())
         self.dirt = build_dirt_variants(make_dirt_texture())
+        self.hedges = build_hedge_variants()
         self.font_hint = load_font(18)
         self.font_big = load_font(36, bold=True)
         self.font_small = load_font(20)
@@ -319,6 +560,7 @@ class Game:
     def reset(self, seed: int):
         self.seed = seed & 0x7FFFFFFF
         self.grid = generate_maze(MAZE_SIZE, self.seed)
+        self.hedge_variant = hedge_variant_grid(self.grid, self.seed)
         self.col = 1
         self.row = 1
         self.src = (1, 1)
@@ -591,52 +833,11 @@ class Game:
         )
 
     def _draw_hedge(self, screen, col: int, row: int, tx: int, ty: int):
-        shift = ((col * 13 + row * 7) % 11) - 5
-        top = self._fog((40 + shift, 98 + shift, 42), ty)
-        left = self._fog((16 + shift // 3, 48 + shift // 3, 22), ty)
-        right = self._fog((26 + shift // 3, 70 + shift // 3, 30), ty)
-        hw = TILE_W // 2
-        hh = TILE_H // 2
-        ground = (
-            (tx, ty),
-            (tx + hw, ty + hh),
-            (tx, ty + TILE_H),
-            (tx - hw, ty + hh),
-        )
-        raised = tuple((x, y - HEDGE_H) for x, y in ground)
-        left_face = (ground[3], ground[2], raised[2], raised[3])
-        right_face = (ground[1], ground[2], raised[2], raised[1])
-        pygame.draw.polygon(screen, left, left_face)
-        pygame.draw.polygon(screen, right, right_face)
-        pygame.draw.polygon(screen, top, raised)
-        cx, cy = tx, ty - HEDGE_H + TILE_H // 2
-        inset = (
-            (cx, cy - int(hh * 0.62)),
-            (cx + int(hw * 0.62), cy),
-            (cx, cy + int(hh * 0.62)),
-            (cx - int(hw * 0.62), cy),
-        )
-        cushion = self._fog((56 + shift, 122 + shift, 50), ty)
-        pygame.draw.polygon(screen, cushion, inset)
-        h = (col * 92821 + row * 68917 + 17) & 0xFFFFFFFF
-        for i in range(4):
-            h = (h * 1664525 + 1013904223) & 0xFFFFFFFF
-            u = ((h >> 8) % 100) / 100.0 - 0.5
-            h = (h * 1664525 + 1013904223) & 0xFFFFFFFF
-            v = ((h >> 8) % 100) / 100.0 - 0.5
-            if abs(u) * 2 + abs(v) * 2 > 0.85:
-                continue
-            fleck = (96, 168, 86) if i % 2 == 0 else (40, 96, 44)
-            pygame.draw.circle(
-                screen,
-                self._fog(fleck, ty),
-                (int(cx + u * hw), int(cy + v * hh)),
-                2,
-            )
-        outline = self._fog((16, 42, 22), ty)
-        pygame.draw.polygon(screen, outline, raised, 1)
-        pygame.draw.line(screen, outline, left_face[0], left_face[3], 1)
-        pygame.draw.line(screen, outline, right_face[0], right_face[3], 1)
+        """Pre-rendered leafy block; same footprint and height as the tile."""
+        k = max(0.0, min(1.0, ty / WIN_H))
+        shade = int(round(k * (N_HEDGE_SHADES - 1)))
+        sprite = self.hedges[self.hedge_variant[row][col]][shade]
+        screen.blit(sprite, (tx - HEDGE_OX, ty - HEDGE_OY))
 
     def _draw_exit(self, screen, tx: int, ty: int):
         stone = self._fog((214, 198, 150), ty)
