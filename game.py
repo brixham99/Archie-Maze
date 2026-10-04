@@ -117,26 +117,25 @@ DEMAT_MIN_MS = 3000          # with a user-supplied sound, the fade follows its 
 DEMAT_MAX_MS = 15000         # ... clamped to 3-15 s
 DEMAT_END_GAP_MS = 300       # the box has fully faded this long before the effect ends
 DEMAT_PULSE_MS = 1000        # one fade pulse (and one wheeze-groan) per second (longer for long clips)
-DEMAT_BACK = 0.32            # cells behind Archie's start spot, so he stands in front
 DEMAT_LEVELS = 24            # pre-faded copies of the TARDIS (no set_alpha on RGBA)
 TARDIS_LAMP_SRC = (59, 11)   # roof lamp in the 119x200 source image
 DISGUISE_KEYS = (pygame.K_h, pygame.K_LSHIFT, pygame.K_RSHIFT)
 MUTE_KEY = pygame.K_m
 
 # --- Reaching the TARDIS: Archie goes in, it dematerialises, next level ---
-EXIT_DOOR_OPEN_MS = 300      # the door swings open, warm light inside
-EXIT_GLIDE_START_MS = 150    # Archie glides round into the doorway ...
-EXIT_GLIDE_MS = 1100         # ... shrinking a little and fading as he goes in
-EXIT_DOOR_CLOSE_AT = 1300    # then the door closes
-EXIT_DOOR_CLOSE_MS = 350
-EXIT_DEMAT_AT = 1750         # and the TARDIS dematerialises (same as the start)
+EXIT_WALK_MS = 500           # Archie walks on from his corridor into the TARDIS ...
+EXIT_FADE_FROM = 0.3         # ... fading out from 30% of the way ...
+EXIT_FADE_TO = 0.9           # ... to gone at 90% (normal depth order: hedges and the box hide him)
+EXIT_DEMAT_AT = 900          # then the TARDIS dematerialises (same as the start)
 EXIT_CARD_GAP_MS = 250       # short pause once it has gone
 CARD_FADE_MS = 450           # fade to black, the new maze is made ...
 CARD_HOLD_MS = 1000          # ... "Level N" on black ...
 LEVEL_BANNER_MS = 2600       # "Level N" banner at the start of a level
-# Right-hand door on the TARDIS's SW (front-left) face, in the 119x200 source:
-# top-left, top-right (hinge side), bottom-right, bottom-left.
-TARDIS_DOOR_SRC = ((34, 70), (56, 78), (56, 175), (34, 166))
+COMPLETE_TEXT = "Level complete!"
+COMPLETE_SIZE = 40           # plain white text with a soft drop shadow, window resolution
+COMPLETE_Y = 0.2             # its top, as a fraction of the window height (clear of the TARDIS)
+COMPLETE_FADE_IN_MS = 300
+COMPLETE_FADE_OUT_MS = 400
 
 # --- Sound effects (assets/sounds, made by tools/make_sounds.py) ---
 SOUND_DIR = os.path.join(HERE, "assets", "sounds")
@@ -172,11 +171,15 @@ RUSTLE_GAP_MS = 450          # the soft rustle at most about twice a second
 HUM_FILE = "dalek_hum.wav"
 HUM_CHANNELS = 4             # reserved hum channels, given to the loudest Daleks
 HUM_MAX = 0.5                # channel volume when a Dalek is right next to Archie
-HUM_FAR = 14.0               # silent at this effective distance (cells) ...
+HUM_FAR = 25.0               # silent at this effective distance (cells) ...
 HUM_NEAR = 1.0               # ... full volume at this one or closer
-HUM_CURVE = 1.3              # volume = closeness ** 1.3: clear within ~6 cells, faint out to ~14
-HUM_STOP_DIST = 16.0         # beyond this (and silent) its channel is stopped
-HUM_PATH_WEIGHT = 0.65       # effective distance = 65% maze path + 35% straight line
+HUM_CURVE = 1.0              # volume = closeness ** 1.0 (linear): faint but clear far off, louder up close
+HUM_STOP_DIST = 28.0         # beyond this (and silent) its channel is stopped
+HUM_PATH_WEIGHT = 0.0        # 0: straight-line distance only; heard through hedges, any route
+HUM_SUM_MAX = 0.8            # several Daleks at once: all hums scale down so their sum stays below this
+HUM_GAIN_SMOOTH_MS = 250     # (that scaling changes smoothly)
+HUM_SWAP_MS = 120            # a channel crossfades to a louder Dalek over this long ...
+HUM_SWAP_MARGIN = 1.3        # ... once the newcomer is this much louder than the quietest one
 HUM_FADE_OUT_MS = 80         # quick fade when a Dalek stops to turn (pause is 160 ms)
 HUM_FADE_IN_MS = 110         # and back up as it glides off again
 HUM_EXIT_FADE_MS = 1000      # gentle fade as the Daleks freeze when Archie reaches the TARDIS
@@ -393,8 +396,9 @@ def build_dirt_variants(texture: pygame.Surface):
         return out
 
     fill_pts = grow(raw, 1.6)
-    mask = pygame.Surface((sw, sh), pygame.SRCALPHA)
+    mask = _new_rgba((sw, sh))
     pygame.draw.polygon(mask, (255, 255, 255, 255), fill_pts)
+    mask_alpha = pygame.surfarray.array_alpha(mask)
     variants = []
     for i in range(N_DIRT):
         ox = (i * 53 + 17) % tw
@@ -404,16 +408,20 @@ def build_dirt_variants(texture: pygame.Surface):
         patch.blit(texture, (tw, 0))
         patch.blit(texture, (0, th))
         patch.blit(texture, (tw, th))
-        base = pygame.Surface((sw, sh), pygame.SRCALPHA)
+        base = _new_rgba((sw, sh))
         base.blit(patch, (-ox, -oy))
-        base.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        # The diamond's alpha copied in directly (no blend-mode blits).
+        alpha = pygame.surfarray.pixels_alpha(base)
+        alpha[:] = mask_alpha
+        del alpha
         pygame.draw.polygon(base, DIRT_EDGE, raw, 1)
         shades = []
         for factor in DIRT_SHADES:
             shaded = base.copy()
-            level = max(0, min(255, int(round(factor * 255))))
-            shaded.fill((level, level, level, 255), special_flags=pygame.BLEND_RGBA_MULT)
-            shades.append(shaded.convert_alpha())
+            rgb = pygame.surfarray.pixels3d(shaded)
+            rgb[:] = np.clip(rgb.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+            del rgb
+            shades.append(_finish_rgba(shaded))
         variants.append(shades)
     return variants
 
@@ -604,12 +612,34 @@ def render_hedge_variant(index: int, seed: int = 4242) -> np.ndarray:
     return np.clip(img, 0, 255).astype(np.uint8).reshape(H, W, 4)
 
 
-def _rgba_surface(arr):
-    H, W, _ = arr.shape
-    surf = pygame.Surface((W, H), pygame.SRCALPHA)
-    pygame.surfarray.pixels3d(surf)[:] = np.transpose(arr[..., :3], (1, 0, 2))
-    pygame.surfarray.pixels_alpha(surf)[:] = arr[..., 3].T
+def _new_rgba(size) -> pygame.Surface:
+    """A blank per-pixel-alpha surface: 32-bit, explicitly cleared to fully
+    transparent (never relying on how new memory is initialised)."""
+    surf = pygame.Surface((max(1, int(size[0])), max(1, int(size[1]))), pygame.SRCALPHA, 32)
+    surf.fill((0, 0, 0, 0))
     return surf
+
+
+def _finish_rgba(surf: pygame.Surface) -> pygame.Surface:
+    """Converted to the display's per-pixel-alpha format (the same path the
+    sprites take from image.load().convert_alpha()), so blits behave the same
+    on every pygame/SDL build. Before a display exists it is left as it is."""
+    if pygame.display.get_init() and pygame.display.get_surface() is not None:
+        return surf.convert_alpha()
+    return surf
+
+
+def _rgba_from_array(arr) -> pygame.Surface:
+    """Surface from an explicit (H, W, 4) uint8 RGBA array: every pixel's alpha
+    is written by us, then converted like the sprites."""
+    arr = np.ascontiguousarray(arr, dtype=np.uint8)
+    H, W, _ = arr.shape
+    surf = pygame.image.frombuffer(arr.tobytes(), (W, H), "RGBA")
+    return _finish_rgba(surf) if pygame.display.get_surface() is not None else surf.copy()
+
+
+def _rgba_surface(arr):
+    return _rgba_from_array(arr)
 
 
 def build_hedge_variants():
@@ -692,7 +722,7 @@ def _load_scaled(path: str, height: int):
     _despill(src)
     k = height / src.get_height()
     w = max(1, round(src.get_width() * k))
-    return src, pygame.transform.smoothscale(src, (w, height)), k
+    return src, _finish_rgba(pygame.transform.smoothscale(src, (w, height))), k
 
 
 def _alpha_scaled(image: pygame.Surface, k: float) -> pygame.Surface:
@@ -704,6 +734,31 @@ def _alpha_scaled(image: pygame.Surface, k: float) -> pygame.Surface:
     return out
 
 
+def _shadowed_text_fades(font: pygame.font.Font, text: str, levels: int):
+    """Plain white text with a soft dark drop shadow, composited once into a
+    per-pixel-alpha surface; returns pre-faded copies, index 0 invisible and
+    the last one solid. Drawn straight onto the window: no scaling, no wobble."""
+    glyphs = font.render(text, True, (255, 255, 255))
+    w, h = glyphs.get_size()
+    pad, off = 4, 2
+    W, H = w + pad * 2, h + pad * 2
+    a_text = np.zeros((W, H), np.float32)
+    a_text[pad:pad + w, pad:pad + h] = pygame.surfarray.array_alpha(glyphs) / 255.0
+    # Shadow: the glyph alpha, offset down-right and softened with a 3x3 box blur.
+    a_sh = np.zeros((W, H), np.float32)
+    a_sh[pad + off:pad + off + w, pad + off:pad + off + h] = pygame.surfarray.array_alpha(glyphs)[:W - pad - off, :H - pad - off] / 255.0
+    p = np.pad(a_sh, 1)
+    a_sh = sum(p[1 + dx:1 + dx + W, 1 + dy:1 + dy + H] for dx in (-1, 0, 1) for dy in (-1, 0, 1)) / 9.0
+    a_sh *= 0.7
+    a_out = a_text + a_sh * (1.0 - a_text)
+    lum = np.where(a_out > 0, 255.0 * a_text / np.maximum(a_out, 1e-6), 0.0)
+    arr = np.zeros((H, W, 4), np.uint8)
+    arr[..., :3] = np.clip(lum, 0, 255).astype(np.uint8).T[:, :, None]
+    arr[..., 3] = np.clip(a_out * 255.0 + 0.5, 0, 255).astype(np.uint8).T
+    out = _rgba_from_array(arr)
+    return [_alpha_scaled(out, i / (levels - 1)) for i in range(levels)]
+
+
 def _faded_silhouettes(image: pygame.Surface, levels: int):
     """White silhouettes of a sprite: index 0 opaque, the last one invisible."""
     white = image.copy()
@@ -711,6 +766,42 @@ def _faded_silhouettes(image: pygame.Surface, levels: int):
     rgb[:] = 255
     del rgb
     return [_alpha_scaled(white, 1.0 - i / (levels - 1)) for i in range(levels)]
+
+
+# The laser beam, outermost layer first: (half-width px at jitter 1, colour, peak alpha).
+BEAM_LAYERS = ((9.0, (40, 90, 220), 70), (5.0, (70, 140, 250), 130), (2.5, (160, 210, 255), 210), (1.2, (255, 255, 255), 255))
+
+
+def _beam_layer(start, end, jitter: float, fade: float):
+    """The beam as an explicit RGBA array: each pixel's distance to the line
+    gives soft layered alphas (blue halo, white core), composited "over" in
+    numpy. Every pixel's alpha is written by us, so nothing outside the beam
+    can come out opaque on any pygame/SDL build. Returns (surface, left, top)."""
+    x0, y0 = start
+    x1, y1 = end
+    pad = int(BEAM_LAYERS[0][0] * 1.3 + 4)
+    left = int(min(x0, x1)) - pad
+    top = int(min(y0, y1)) - pad
+    w = int(abs(x1 - x0)) + pad * 2 + 1
+    h = int(abs(y1 - y0)) + pad * 2 + 1
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    xs += left + 0.5
+    ys += top + 0.5
+    dx, dy = x1 - x0, y1 - y0
+    len2 = max(1e-6, dx * dx + dy * dy)
+    u = np.clip(((xs - x0) * dx + (ys - y0) * dy) / len2, 0.0, 1.0)
+    dist = np.hypot(xs - (x0 + u * dx), ys - (y0 + u * dy))
+    a_out = np.zeros((h, w), np.float32)
+    rgb = np.zeros((h, w, 3), np.float32)  # premultiplied
+    for half, colour, peak in BEAM_LAYERS:
+        r = max(0.8, half * jitter)
+        a = np.clip(1.0 - dist / r, 0.0, 1.0) ** 0.8 * (peak / 255.0) * fade
+        rgb = np.array(colour, np.float32) * a[..., None] + rgb * (1.0 - a[..., None])
+        a_out = a + a_out * (1.0 - a)
+    arr = np.zeros((h, w, 4), np.uint8)
+    arr[..., :3] = np.clip(rgb / np.maximum(a_out, 1e-6)[..., None], 0, 255).astype(np.uint8)
+    arr[..., 3] = np.clip(a_out * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return _rgba_from_array(arr), left, top
 
 
 def _make_glow(radius: int, colour, strength: float = 1.0) -> pygame.Surface:
@@ -722,14 +813,10 @@ def _make_glow(radius: int, colour, strength: float = 1.0) -> pygame.Surface:
     fall = np.clip(1.0 - d, 0.0, 1.0)
     core = fall ** 3
     rgb = np.array(colour, dtype=np.float64)[None, None, :] * (1 - core[..., None]) + 255.0 * core[..., None]
-    surf = pygame.Surface((size, size), pygame.SRCALPHA)
-    px = pygame.surfarray.pixels3d(surf)
-    px[:] = rgb.clip(0, 255).astype(np.uint8).transpose(1, 0, 2)
-    del px
-    al = pygame.surfarray.pixels_alpha(surf)
-    al[:] = (255.0 * strength * fall ** 1.6).clip(0, 255).astype(np.uint8).T
-    del al
-    return surf.convert_alpha()
+    arr = np.zeros((size, size, 4), np.uint8)  # (row, col, RGBA)
+    arr[..., :3] = rgb.clip(0, 255).astype(np.uint8)
+    arr[..., 3] = (255.0 * strength * fall ** 1.6).clip(0, 255).astype(np.uint8)
+    return _rgba_from_array(arr)
 
 
 def _glow_sizes(glow: pygame.Surface, smallest: int = 4):
@@ -738,7 +825,7 @@ def _glow_sizes(glow: pygame.Surface, smallest: int = 4):
     out = []
     for i in range(GLOW_SIZES):
         size = max(smallest, int(round(smallest + (full - smallest) * i / (GLOW_SIZES - 1))))
-        out.append(pygame.transform.smoothscale(glow, (size, size)))
+        out.append(_finish_rgba(pygame.transform.smoothscale(glow, (size, size))))
     return out
 
 
@@ -935,7 +1022,7 @@ class Game:
             h = image.get_height()
             if h != SPRITE_H:
                 w = max(1, round(image.get_width() * SPRITE_H / h))
-                image = pygame.transform.smoothscale(image, (w, SPRITE_H))
+                image = _finish_rgba(pygame.transform.smoothscale(image, (w, SPRITE_H)))
             self.sprites[key] = image
             self.anchors[key] = _feet_anchor(image)
         # White silhouettes for the death flicker, pre-faded. Built with numpy so
@@ -951,7 +1038,7 @@ class Game:
             mirror = {"se": "sw", "ne": "nw"}[key]
             src, image, k = _load_scaled(DALEK_FILES[key], DALEK_H)
             sw = src.get_width()
-            flipped = pygame.transform.flip(image, True, False)
+            flipped = _finish_rgba(pygame.transform.flip(image, True, False))
             for name, img, flip in ((key, image, False), (mirror, flipped, True)):
                 self.dalek_sprites[name] = img
                 self.dalek_anchor[name] = _base_anchor(img)
@@ -962,34 +1049,38 @@ class Game:
                 self.dalek_gun[name] = ((gx + 0.5) * k, (gy + 0.5) * k)
                 self.dalek_eye[name] = ((ex + 0.5) * k, (ey + 0.5) * k)
         _src, self.tardis, tk = _load_scaled(TARDIS_FILE, TARDIS_H)
-        self._exit_door = None
         self.tardis_k = tk
         self.tardis_anchor = _base_anchor(self.tardis)
         self.tardis_lamp = ((TARDIS_LAMP_SRC[0] + 0.5) * tk, (TARDIS_LAMP_SRC[1] + 0.5) * tk)
-        self.dalek_shadow = pygame.Surface((50, 18), pygame.SRCALPHA)
+        self.dalek_shadow = _new_rgba((50, 18))
         pygame.draw.ellipse(self.dalek_shadow, (30, 20, 10, 120), self.dalek_shadow.get_rect())
-        self.tardis_shadow = pygame.Surface((76, 30), pygame.SRCALPHA)
+        self.dalek_shadow = _finish_rgba(self.dalek_shadow)
+        self.tardis_shadow = _new_rgba((76, 30))
         pygame.draw.ellipse(self.tardis_shadow, (24, 16, 8, 110), self.tardis_shadow.get_rect())
+        self.tardis_shadow = _finish_rgba(self.tardis_shadow)
         # Dematerialisation: pre-faded TARDIS and shadow (alpha copied exactly,
         # scaled with numpy) and a lamp glow at a few brightness levels.
         self.demat_fades = [_alpha_scaled(self.tardis, i / (DEMAT_LEVELS - 1)) for i in range(DEMAT_LEVELS)]
         self.demat_shadows = [_alpha_scaled(self.tardis_shadow, i / (DEMAT_LEVELS - 1)) for i in range(DEMAT_LEVELS)]
         lamp = _make_glow(11, (255, 236, 190))
         self.demat_lamps = [_alpha_scaled(lamp, i / 11) for i in range(12)]
-        self.scorch = pygame.Surface((34, 14), pygame.SRCALPHA)
+        self.scorch = _new_rgba((34, 14))
         pygame.draw.ellipse(self.scorch, (20, 12, 6, 170), self.scorch.get_rect())
         pygame.draw.ellipse(self.scorch, (10, 6, 4, 200), self.scorch.get_rect().inflate(-14, -6))
+        self.scorch = _finish_rgba(self.scorch)
         self.glow_eye = _glow_sizes(_make_glow(int(13 * ZOOM), (190, 235, 255)))
         self.glow_hit = _glow_sizes(_make_glow(int(16 * ZOOM), (140, 200, 255)))
         self.puffs = []  # puffs[size][alpha level], pre-faded
         for radius in (2, 3, 4, 5, 6):
-            puff = pygame.Surface((radius * 2 + 2, radius * 2 + 2), pygame.SRCALPHA)
+            puff = _new_rgba((radius * 2 + 2, radius * 2 + 2))
             pygame.draw.circle(puff, (214, 236, 190, 255), (radius + 1, radius + 1), radius)
             pygame.draw.circle(puff, (246, 252, 236, 255), (radius, radius), max(1, radius - 2))
+            puff = _finish_rgba(puff)
             self.puffs.append([_alpha_scaled(puff, i / (PUFF_LEVELS - 1)) for i in range(PUFF_LEVELS)])
         self.disguise_cache = {}
-        self.shadow = pygame.Surface((40, 16), pygame.SRCALPHA)
+        self.shadow = _new_rgba((40, 16))
         pygame.draw.ellipse(self.shadow, (48, 30, 16, 110), self.shadow.get_rect())
+        self.shadow = _finish_rgba(self.shadow)
         self.dirt = build_dirt_variants(make_dirt_texture())
         self.hedges = build_hedge_variants()
         self.view_w = max(1, int(round(WIN_W / ZOOM)))
@@ -1007,21 +1098,29 @@ class Game:
         self.level = max(1, int(level))
         # Full-window fade for the level card: a per-pixel-alpha surface filled
         # with translucent black (same kind of blit as the HUD boxes).
-        self.fader = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        self.fader = _finish_rgba(_new_rgba((WIN_W, WIN_H)))  # filled with RGBA each frame
+        self.complete_fades = _shadowed_text_fades(load_font(COMPLETE_SIZE, bold=True), COMPLETE_TEXT, 16)
+        self.archie_fades = {}    # (sprite key, level) -> faded copy, for walking into the TARDIS
+        self.hum_gain = 1.0
         self.card_t0 = None       # level card running (survives reset)
         self.card_switched = False
         self.hum_assign = [None] * HUM_CHANNELS
+        self.hum_ch_gain = [0.0] * HUM_CHANNELS
+        self.hum_releasing = [False] * HUM_CHANNELS
         self.reset(seed if seed is not None else (time.time_ns() & 0x7FFFFFFF))
 
     def reset(self, seed: int, banner: bool = True):
-        """A new maze for the current level (after death, or a level change)."""
+        """A new maze for self.level (level 1 after a death, or the next level)."""
         self.sfx.stop_all()
         self.hum_assign = [None] * HUM_CHANNELS
+        self.hum_ch_gain = [0.0] * HUM_CHANNELS
+        self.hum_releasing = [False] * HUM_CHANNELS
         self.num_daleks = daleks_for_level(self.level)
         self.banner = banner      # show the "Level N" banner as it starts
         self.exit_t0 = None       # Archie heading into the exit TARDIS
-        self.exit_from = (1, 1)
+        self.exit_from = None
         self.exit_facing = DIR_SE
+        self.exit_steps = 0
         self.exit_demat_t0 = None
         self.bump_times = []
         self.last_bump_t = -1e9
@@ -1032,13 +1131,16 @@ class Game:
         self.seed = seed & 0x7FFFFFFF
         self.grid = generate_maze(MAZE_SIZE, self.seed)
         self.hedge_variant = hedge_variant_grid(self.grid, self.seed)
-        self.col = 1
-        self.row = 1
-        self.src = (1, 1)
-        self.dst = (1, 1)
-        self.facing_index = 0
-        self.facing = DIR_ORDER[0]
-        self.turn_from = DIR_ORDER[0]
+        # The TARDIS that brought him stands on (1, 1); Archie starts one cell
+        # forward along the open path, facing on into the maze, away from it.
+        self.demat_cell = (1, 1)
+        start_dir = next(d for d in DIR_ORDER if self.is_open(1 + d[0], 1 + d[1]))
+        self.start_cell = (1 + start_dir[0], 1 + start_dir[1])
+        self.col, self.row = self.start_cell
+        self.src = self.dst = self.start_cell
+        self.facing_index = DIR_ORDER.index(start_dir)
+        self.facing = start_dir
+        self.turn_from = start_dir
         self.turning = False
         self.turn_t0 = 0
         self.turn_sign = 0
@@ -1052,7 +1154,7 @@ class Game:
         self.last_now = None
         self.dead = False
         self.death_t0 = 0.0
-        self.dead_pos = (1.0, 1.0)
+        self.dead_pos = (float(self.col), float(self.row))
         self.shooter = None
         self.disguised = False
         self.disguise_t0 = -1e9
@@ -1067,8 +1169,6 @@ class Game:
             self.demat_len = max(DEMAT_MIN_MS, min(DEMAT_MAX_MS, real))
         else:
             self.demat_len = DEMAT_MS
-        self.demat_cell = (1, 1)
-        self.demat_back = (-DIR_ORDER[0][0], -DIR_ORDER[0][1])  # behind his start facing
         self.daleks = []
         self._hum_from = None
         self._hum_dist = {}
@@ -1091,7 +1191,7 @@ class Game:
 
     def _spawn_daleks(self):
         rng = random.Random((self.seed * 2654435761 + 12345) & 0xFFFFFFFF)
-        from_start = self._path_dist((1, 1))
+        from_start = self._path_dist(self.start_cell)
         from_exit = self._path_dist(self.exit_cell)
         # The full rule is >= 12 cells from the start and >= 10 from the exit;
         # a small maze that cannot fit them all relaxes those distances.
@@ -1102,7 +1202,7 @@ class Game:
                 if d >= DALEK_MIN_START_DIST * k
                 and from_exit.get(cell, 0) >= DALEK_MIN_EXIT_DIST * k
                 and self.grid[cell[1]][cell[0]] == PATH
-                and cell != (1, 1)
+                and cell not in (self.start_cell, self.demat_cell)
             )
             if len(cands) >= self.num_daleks:
                 break
@@ -1168,7 +1268,8 @@ class Game:
         opts = []
         for dirn in DIR_ORDER:
             n = (c + dirn[0], r + dirn[1])
-            if not self.is_open(*n) or n == self.exit_cell or n in others:
+            if (not self.is_open(*n) or n == self.exit_cell or n in others
+                    or (n == self.demat_cell and self.start_tardis_up(now))):
                 continue
             if n in archie and not exposed:
                 continue  # a hedge (or a corpse) is in the way: turn away
@@ -1328,7 +1429,7 @@ class Game:
         self.last_now = now
         if name == "tardis_exit":
             # Archie next to the exit, stepping into the TARDIS. --scene-ms
-            # counts from that step: door, glide in, demat from 1.75 s, then the card.
+            # counts from that step: he walks in (0.5 s), demat from 0.9 s, then the card.
             ec, er = self.exit_cell
             for dirn in DIR_ORDER:
                 c, r = ec - dirn[0], er - dirn[1]
@@ -1340,9 +1441,9 @@ class Game:
             self.demat_t0 = self.start_t0 + DEMAT_WAIT_MS
             self.banner = False
             self._start_step(1, now)
-            return 800.0
+            return 300.0
         if name == "tardis_demat":
-            # The start of a game: Archie on his start cell, the TARDIS behind him.
+            # The start of a level: the TARDIS on (1, 1), Archie one cell in front of it.
             self._park_other_daleks(None)
             self.start_t0 = now
             self.demat_t0 = None
@@ -1437,7 +1538,8 @@ class Game:
         if sign < 0:
             dc, dr = -dc, -dr
         nc, nr = self.col + dc, self.row + dr
-        if not self.is_open(nc, nr) or (nc, nr) in self._dalek_cells():
+        if (not self.is_open(nc, nr) or (nc, nr) in self._dalek_cells()
+                or ((nc, nr) == self.demat_cell and self.start_tardis_up(now))):
             if self.bump_dir != (dc, dr):
                 self.bump_dir = (dc, dr)
                 self.bump_t0 = now
@@ -1525,7 +1627,8 @@ class Game:
         if self.card_t0 is not None:
             return  # the level card is showing
         if key in RESTART_KEYS and self.dead and now - self.death_t0 >= LASER_MS:
-            self.reset(time.time_ns() & 0x7FFFFFFF)  # same level, new maze
+            self.level = 1  # start again from level 1 in a new maze
+            self.reset(time.time_ns() & 0x7FFFFFFF)
             return
         if key in DISGUISE_KEYS:
             self.toggle_disguise(now)
@@ -1595,13 +1698,14 @@ class Game:
 
     # ----- Reaching the TARDIS --------------------------------------------
     def _begin_exit(self, now: float):
-        """Input locks and the Daleks freeze; Archie goes in through the door."""
+        """Input locks and the Daleks freeze; Archie walks on into the TARDIS."""
         if self.won or self.dead:
             return
         self.won = True
         self.exit_t0 = now
         self.exit_from = (self.col, self.row)
         self.exit_facing = self.facing
+        self.exit_steps = 0
         self.moving = self.turning = False
         self.queued = None
         self.wish = None
@@ -1612,6 +1716,10 @@ class Game:
         if self.exit_t0 is None:
             return
         t = now - self.exit_t0
+        # Two soft footsteps as he walks in.
+        if self.exit_steps < 2 and t >= EXIT_WALK_MS * (0.25 + 0.4 * self.exit_steps):
+            self.exit_steps += 1
+            self.sfx.step()
         if self.exit_demat_t0 is None and t >= EXIT_DEMAT_AT:
             self.exit_demat_t0 = self.exit_t0 + EXIT_DEMAT_AT
             self.sfx.play("tardis_demat")
@@ -1626,26 +1734,34 @@ class Game:
         self.level += 1
         self.reset(time.time_ns() & 0x7FFFFFFF, banner=False)
 
-    def exit_door_open(self, now: float) -> float:
-        """0 (shut) .. 1 (wide open) for the exit TARDIS door."""
+    def start_tardis_up(self, now: float) -> bool:
+        """The TARDIS that brought Archie still stands on its cell (solid for
+        5 s, then dematerialising); nobody walks into it meanwhile."""
+        return self.demat_t0 is None or now - self.demat_t0 < self.demat_len
+
+    def exit_walk_u(self, now: float) -> float:
+        """0..1 along Archie's walk from his corridor into the exit TARDIS."""
         if self.exit_t0 is None:
             return 0.0
-        t = now - self.exit_t0
-        if t < EXIT_DOOR_OPEN_MS:
-            return ease(t / EXIT_DOOR_OPEN_MS)
-        if t < EXIT_DOOR_CLOSE_AT:
-            return 1.0
-        return 1.0 - ease((t - EXIT_DOOR_CLOSE_AT) / EXIT_DOOR_CLOSE_MS)
+        return max(0.0, min(1.0, (now - self.exit_t0) / EXIT_WALK_MS))
+
+    def exit_fade(self, now: float) -> float:
+        """Archie's opacity as he walks into the TARDIS (1 = solid)."""
+        u = self.exit_walk_u(now)
+        return max(0.0, min(1.0, 1.0 - (u - EXIT_FADE_FROM) / (EXIT_FADE_TO - EXIT_FADE_FROM)))
 
     # ----- Dalek proximity hum -------------------------------------------
     def _hum_distance(self, d: Dalek, archie_pos) -> float:
-        """Blend of path distance through the maze (hedges block sound) and
-        straight-line distance, in cells, from Archie to Dalek d."""
+        """Distance in cells from Archie to Dalek d for its hum: the straight
+        line (hedges do not muffle it), optionally blended with the path
+        distance through the maze when HUM_PATH_WEIGHT > 0."""
+        straight = math.hypot(d.pos[0] - archie_pos[0], d.pos[1] - archie_pos[1])
+        if HUM_PATH_WEIGHT <= 0.0:
+            return straight
         here = (self.col, self.row)
         if self._hum_from != here:
             self._hum_from = here
             self._hum_dist = self._path_dist(here)
-        straight = math.hypot(d.pos[0] - archie_pos[0], d.pos[1] - archie_pos[1])
         tx, ty = d.target
         dx, dy = tx - d.pos[0], ty - d.pos[1]
         frac = min(1.0, abs(dx) + abs(dy))  # how far it still has to go to its target
@@ -1686,26 +1802,54 @@ class Game:
             pan = max(-1.0, min(1.0, (dx - ax) / (self.view_w / 2))) * HUM_PAN
             d.hum_lr = (vol * (1.0 - max(0.0, pan)), vol * (1.0 + min(0.0, pan)))
             d.hum_vol = vol
-        # HUM_CHANNELS reserved channels go to the loudest audible Daleks. A
-        # channel only changes hands once its Dalek is silent (or nearly), so
-        # the volume never jumps.
-        assign = self.hum_assign
+        # HUM_CHANNELS reserved channels carry the loudest audible Daleks. When
+        # a louder Dalek (by HUM_SWAP_MARGIN) is left out, the quietest channel
+        # fades out over HUM_SWAP_MS and the newcomer fades in on it, so the
+        # volume never jumps.
+        assign, gains, releasing = self.hum_assign, self.hum_ch_gain, self.hum_releasing
+        step = dt / HUM_SWAP_MS if dt > 0 else 1.0
         for ci, d in enumerate(assign):
             if d is not None and (d not in self.daleks or d.hum_vol <= 0.0):
-                assign[ci] = None
-        for d in sorted((d for d in self.daleks if d.hum_vol > 0.0 and d not in assign), key=lambda d: -d.hum_vol):
-            free = [ci for ci, x in enumerate(assign) if x is None]
-            if free:
-                assign[free[0]] = d
+                assign[ci], gains[ci], releasing[ci] = None, 0.0, False  # silent already
+        audible = sorted((d for d in self.daleks if d.hum_vol > 0.0), key=lambda d: -d.hum_vol)
+        want = audible[:HUM_CHANNELS]
+        waiting = [d for d in want if d not in assign]
+        for ci, d in enumerate(assign):
+            if d is None:
                 continue
-            ci = min(range(len(assign)), key=lambda c: assign[c].hum_vol)
-            if assign[ci].hum_vol < 0.01 and d.hum_vol > 2.0 * assign[ci].hum_vol:
-                assign[ci] = d
+            if d in want:
+                releasing[ci] = False
+            elif waiting and waiting[0].hum_vol > d.hum_vol * HUM_SWAP_MARGIN and not any(releasing):
+                releasing[ci] = True  # one hand-over at a time
+        for ci, d in enumerate(assign):
+            if d is None:
+                continue
+            if releasing[ci]:
+                gains[ci] = max(0.0, gains[ci] - step)
+                if gains[ci] <= 0.0:
+                    assign[ci], releasing[ci] = None, False
+            else:
+                gains[ci] = min(1.0, gains[ci] + step)
+        for d in waiting:
+            if d in assign:
+                continue
+            free = [ci for ci, x in enumerate(assign) if x is None]
+            if not free:
+                break
+            assign[free[0]], gains[free[0]], releasing[free[0]] = d, 0.0, False
+        # Several Daleks at once: scale them all down so the sum stays sensible.
+        total = sum(d.hum_vol * gains[ci] for ci, d in enumerate(assign) if d is not None)
+        target = min(1.0, HUM_SUM_MAX / total) if total > 0.0 else 1.0
+        kg = 1.0 - math.exp(-dt / HUM_GAIN_SMOOTH_MS) if dt > 0 else 1.0
+        self.hum_gain += (target - self.hum_gain) * kg
+        if total * self.hum_gain > HUM_SUM_MAX * 1.15:  # never far over, even mid-smoothing
+            self.hum_gain = HUM_SUM_MAX * 1.15 / total
         nearby = active and any(d.hum_dist < HUM_STOP_DIST for d in self.daleks)
         for ci in range(HUM_CHANNELS):
             d = assign[ci]
             left, right = d.hum_lr if d is not None else (0.0, 0.0)
-            self.sfx.set_hum(ci, left, right, nearby)
+            g = gains[ci] * self.hum_gain
+            self.sfx.set_hum(ci, left * g, right * g, nearby)
 
     def _update_archie(self, now: float):
         if self.turning:
@@ -1741,6 +1885,12 @@ class Game:
     def visual_pos(self, now: float):
         if self.dead:
             return self.dead_pos
+        if self.exit_t0 is not None:
+            u = self.exit_walk_u(now)
+            u = u * u * (3.0 - 2.0 * u) * 0.35 + u * 0.65  # steady walk, soft start and stop
+            sc, sr = self.exit_from
+            ec, er = self.exit_cell
+            return sc + (ec - sc) * u, sr + (er - sr) * u
         if self.moving:
             u = self._step_u(now)
             sc, sr = self.src
@@ -1789,7 +1939,7 @@ class Game:
         self._draw_disguise_hud(screen, now)
         self._draw_level_hud(screen)
         if self.dead and now - self.death_t0 >= DEATH_MSG_MS:
-            self._draw_panel(screen, "EXTERMINATED!", f"Level {self.level}.  Press Enter to try again", (255, 96, 72))
+            self._draw_panel(screen, "EXTERMINATED!", f"You reached level {self.level}.  Press Enter to start again", (255, 96, 72))
         self._draw_banners(screen, now)
         self._draw_card(screen, now)
 
@@ -1811,21 +1961,25 @@ class Game:
             t = max(0.0, min(1.0, (now - self.move_t0) / MOVE_MS))
             local = (t * 2.0) % 1.0 if t < 1.0 else 0.0
             feet_sy -= int(round(math.sin(local * math.pi) * 2))
+        elif self.exit_t0 is not None:
+            t = self.exit_walk_u(now)
+            local = (t * 2.0) % 1.0 if t < 1.0 else 0.0
+            feet_sy -= int(round(math.sin(local * math.pi) * 2))
         self.archie_feet = (feet_sx, feet_sy)
         # One pass, back to front. Archie, the Daleks and the TARDIS slot in
         # by depth (row + col) when the tiles in front of them start.
         char_depth = vrow + vcol
         entities = []
-        if self.exit_t0 is None:
-            entities.append((char_depth, 1, lambda: self._draw_archie(screen, feet_sx, feet_sy, now)))
+        # Walking into the exit TARDIS he keeps his normal depth: the box (same
+        # depth, drawn after him) and the hedges in front hide him as he goes in.
+        entities.append((char_depth, 1, lambda: self._draw_archie(screen, feet_sx, feet_sy, now)))
         for d in self.daleks:
             entities.append((d.pos[0] + d.pos[1], 0, lambda d=d: self._draw_dalek(screen, d, now, cam_x, cam_y)))
         ec, er = self.exit_cell
         entities.append((float(ec + er), 2, lambda: self._draw_tardis(screen, cam_x, cam_y, now)))
         if self.demat_t0 is None or now - self.demat_t0 < self.demat_len:
             dc, dr = self.demat_cell
-            # Drawn just before Archie when he is on the start cell (same depth,
-            # lower priority), so he always stands in front of it.
+            # On its own cell, (1, 1), one behind Archie's start cell.
             entities.append((float(dc + dr), 0.5, lambda: self._draw_demat(screen, now, cam_x, cam_y)))
         entities.sort(key=lambda e: (e[0], e[1]))
         k = 0
@@ -1841,9 +1995,6 @@ class Game:
         while k < len(entities):
             entities[k][2]()
             k += 1
-        if self.exit_t0 is not None and self._exit_door is not None:
-            # On top of the hedges: he walks up to the doorway in plain view.
-            self._draw_archie_entering(screen, now, cam_x, cam_y, self._exit_door)
 
     def _fog(self, colour, sy: int):
         # Slight aerial perspective: tiles higher on the screen are a touch darker.
@@ -1875,8 +2026,7 @@ class Game:
 
     def _draw_tardis(self, screen, cam_x: float, cam_y: float, now: float):
         """The exit TARDIS on the exit cell, anchored by the centre of its base.
-        When Archie arrives: the door opens, he goes in, it dematerialises."""
-        self._exit_door = None
+        When Archie has walked into it, it dematerialises."""
         ec, er = self.exit_cell
         fx, fy = tile_origin(ec, er)
         fx -= cam_x
@@ -1889,77 +2039,6 @@ class Game:
         else:
             alpha, lamp = 1.0, 0.0
         self._blit_tardis(screen, fx, fy, alpha, lamp)
-        if self.exit_t0 is None or self.exit_demat_t0 is not None:
-            return
-        ax, ay = self.tardis_anchor
-        k = self.tardis_k
-        ox, oy = fx - ax, fy - ay
-        door = [(ox + x * k, oy + y * k) for x, y in TARDIS_DOOR_SRC]
-        o = self.exit_door_open(now)
-        if o > 0.02:
-            # The doorway opens from the latch side: warm light inside.
-            (x0, y0), (x1, y1), (x2, y2), (x3, y3) = door
-            gap = [(x0, y0), (x0 + (x1 - x0) * o, y0 + (y1 - y0) * o),
-                   (x3 + (x2 - x3) * o, y3 + (y2 - y3) * o), (x3, y3)]
-            pygame.draw.polygon(screen, (196, 150, 78), gap)
-            inner = [(x + (cx - x) * 0.18, y + (cy - y) * 0.12) for (x, y), (cx, cy) in
-                     zip(gap, [((x0 + x2) / 2, (y0 + y2) / 2)] * 4)]
-            pygame.draw.polygon(screen, (255, 232, 168), inner)
-        self._exit_door = door
-
-    def _draw_archie_entering(self, screen, now: float, cam_x: float, cam_y: float, door):
-        """Archie walks up to the open doorway, turns his back and steps in:
-        for the last part he is clipped to the doorway and fades, so he
-        disappears inside. Drawn over the hedges so he stays in view."""
-        t = now - self.exit_t0
-        u = max(0.0, min(1.0, (t - EXIT_GLIDE_START_MS) / EXIT_GLIDE_MS))
-        if u >= 1.0:
-            return
-        sc, sr = self.exit_from
-        x0, y0 = tile_origin(sc, sr)
-        x0 -= cam_x
-        y0 += TILE_H // 2 - cam_y
-        # Door threshold: bottom middle of the doorway.
-        x2 = (door[2][0] + door[3][0]) / 2
-        y2 = (door[2][1] + door[3][1]) / 2
-        if u < 0.55:
-            # Walk to the threshold with a little hop-free arc.
-            e = ease(u / 0.55)
-            x = x0 + (x2 - x0) * e
-            y = y0 + (y2 - y0) * e - math.sin(e * math.pi) * 6
-            scale = 1.0 - 0.12 * e
-            fade = 1.0
-            key = FACING_SPRITE[self.exit_facing] if e < 0.5 else "ne"
-            clip = None
-        else:
-            # Into the doorway: a step back into the box, shrinking and fading.
-            v = (u - 0.55) / 0.45
-            e = ease(v)
-            dx = (door[0][0] + door[1][0]) / 2 - (door[3][0] + door[2][0]) / 2
-            x = x2 + dx * 0.15 * e
-            y = y2 - 6 * e
-            scale = 0.88 - 0.13 * e
-            fade = 1.0 - e
-            key = "ne"  # his back as he goes in
-            xs = [p[0] for p in door]
-            ys = [p[1] for p in door]
-            clip = pygame.Rect(int(min(xs)) - 2, int(min(ys)) - 40, int(max(xs) - min(xs)) + 4,
-                               int(max(ys) - min(ys)) + 40)
-        if fade <= 0.02:
-            return
-        sprite = self.sprites[key]
-        w = max(1, int(round(sprite.get_width() * scale)))
-        h = max(1, int(round(sprite.get_height() * scale)))
-        img = pygame.transform.smoothscale(sprite, (w, h))
-        if fade < 0.999:
-            img = _alpha_scaled(img, fade)
-        axs, ays = self.anchors[key]
-        old_clip = screen.get_clip()
-        if clip is not None:
-            screen.set_clip(clip.clip(old_clip))
-        screen.blit(img, (int(round(x - axs * scale)), int(round(y - ays * scale))))
-        if clip is not None:
-            screen.set_clip(old_clip)
 
     def _blit_tardis(self, screen, fx: float, fy: float, alpha: float, lamp: float):
         """A TARDIS with its base centre at (fx, fy): pre-faded copies (no
@@ -2013,8 +2092,7 @@ class Game:
         if alpha <= 0.0 and lamp <= 0.0:
             return
         dc, dr = self.demat_cell
-        bc, br = self.demat_back
-        fx, fy = tile_origin(dc + bc * DEMAT_BACK, dr + br * DEMAT_BACK)
+        fx, fy = tile_origin(dc, dr)
         fx -= cam_x
         fy += TILE_H // 2 - cam_y
         img_w, img_h = self.tardis.get_size()
@@ -2051,7 +2129,7 @@ class Game:
         if cached is None:
             w = max(1, int(round(base.get_width() * scale)))
             h = max(1, int(round(base.get_height() * scale)))
-            cached = pygame.transform.smoothscale(base, (w, h))
+            cached = _finish_rgba(pygame.transform.smoothscale(base, (w, h)))
             if len(self.disguise_cache) > 64:
                 self.disguise_cache.clear()
             self.disguise_cache[key] = cached
@@ -2104,6 +2182,18 @@ class Game:
                 self._draw_peek_eyes(screen, feet_sx, feet_sy, now)
             self._draw_poof(screen, feet_sx, feet_sy, since_on / POOF_MS)
             return
+        if self.exit_t0 is not None:
+            level = int(round(self.exit_fade(now) * 16))
+            if level <= 0:
+                return
+            if level < 16:
+                faded = self.archie_fades.get((key, level))
+                if faded is None:
+                    faded = (_alpha_scaled(self.shadow, level / 16), _alpha_scaled(sprite, level / 16))
+                    self.archie_fades[(key, level)] = faded
+                screen.blit(faded[0], (feet_sx - self.shadow.get_width() // 2, feet_sy - 6))
+                screen.blit(faded[1], pos)
+                return
         screen.blit(self.shadow, (feet_sx - self.shadow.get_width() // 2, feet_sy - 6))
         screen.blit(sprite, pos)
         if since_off < POOF_MS:
@@ -2173,23 +2263,11 @@ class Game:
         rng = random.Random(int(now // 33))
         x0, y0 = start
         x1, y1 = end
-        pad = 24
-        left = int(min(x0, x1)) - pad
-        top = int(min(y0, y1)) - pad
-        w = int(abs(x1 - x0)) + pad * 2
-        h = int(abs(y1 - y0)) + pad * 2
-        # A small per-pixel-alpha layer: each narrower line overwrites the
-        # wider one (pygame.draw writes RGBA straight in), giving a soft blue
-        # halo round a white core. Blitted normally; no blend flags.
-        layer = pygame.Surface((w, h), pygame.SRCALPHA)
-        a = (x0 - left, y0 - top)
-        b = (x1 - left, y1 - top)
         fade = 1.0 if t < LASER_MS * 0.6 else max(0.0, 1.0 - (t - LASER_MS * 0.6) / (LASER_MS * 0.4))
         j = rng.uniform(0.7, 1.25) * max(0.3, fade)
-        for width, colour, alpha in ((18, (40, 90, 220), 70), (10, (70, 140, 250), 130), (5, (160, 210, 255), 210), (2, (255, 255, 255), 255)):
-            wid = max(1, int(width * j))
-            pygame.draw.line(layer, (*colour, int(alpha * fade)), a, b, wid)
-        screen.blit(layer, (left, top))
+        if fade > 0.01:
+            layer, left, top = _beam_layer(start, end, j, fade)
+            screen.blit(layer, (left, top))
         for (px, py), sizes in (((x0, y0), self.glow_eye), ((x1, y1), self.glow_hit)):
             if fade <= 0.05:
                 continue
@@ -2214,20 +2292,21 @@ class Game:
         text = self.font_hud.render(label, True, (240, 234, 214))
         pad_x, pad_y = 12, 8
         bw = max(text.get_width(), 220)
-        box = pygame.Surface((bw + pad_x * 2, text.get_height() + pad_y * 2 + 10), pygame.SRCALPHA)
+        box = _new_rgba((bw + pad_x * 2, text.get_height() + pad_y * 2 + 10))
         box.fill((36, 24, 16, 190))
         pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
         box.blit(text, (pad_x, pad_y))
         by = pad_y + text.get_height() + 4
         pygame.draw.rect(box, (20, 14, 10, 230), (pad_x, by, bw, 6))
         pygame.draw.rect(box, bar, (pad_x, by, int(bw * max(0.0, min(1.0, frac))), 6))
+        box = _finish_rgba(box)
         screen.blit(box, (WIN_W - box.get_width() - 14, WIN_H - box.get_height() - 14))
 
     def _draw_minimap(self, screen):
         scale = 3
         pad = 6
         size = MAZE_SIZE * scale
-        box = pygame.Surface((size + pad * 2, size + pad * 2), pygame.SRCALPHA)
+        box = _new_rgba((size + pad * 2, size + pad * 2))
         box.fill((36, 24, 16, 200))
         pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
         for row in range(MAZE_SIZE):
@@ -2249,6 +2328,7 @@ class Game:
         py = pad + int(self.row * scale)
         pygame.draw.rect(box, (255, 248, 230), (px, py, scale, scale))
         x = WIN_W - box.get_width() - 14
+        box = _finish_rgba(box)
         screen.blit(box, (x, 14))
 
     def _draw_hint(self, screen):
@@ -2257,19 +2337,21 @@ class Game:
             f"Left and right to turn. Up to step forward. H to hide as a hedge. {mute}", True, (240, 234, 214)
         )
         pad_x, pad_y = 12, 8
-        box = pygame.Surface((text.get_width() + pad_x * 2, text.get_height() + pad_y * 2), pygame.SRCALPHA)
+        box = _new_rgba((text.get_width() + pad_x * 2, text.get_height() + pad_y * 2))
         box.fill((36, 24, 16, 180))
         pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
         x, y = 14, WIN_H - box.get_height() - 14
+        box = _finish_rgba(box)
         screen.blit(box, (x, y))
         screen.blit(text, (x + pad_x, y + pad_y))
 
     def _draw_level_hud(self, screen):
         text = self.font_hud.render(f"Level {self.level}    Daleks: {len(self.daleks)}", True, (240, 234, 214))
         pad_x, pad_y = 12, 7
-        box = pygame.Surface((text.get_width() + pad_x * 2, text.get_height() + pad_y * 2), pygame.SRCALPHA)
+        box = _new_rgba((text.get_width() + pad_x * 2, text.get_height() + pad_y * 2))
         box.fill((36, 24, 16, 180))
         pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
+        box = _finish_rgba(box)
         screen.blit(box, (14, 14))
         screen.blit(text, (14 + pad_x, 14 + pad_y))
 
@@ -2292,8 +2374,12 @@ class Game:
         # "Level complete!" while the TARDIS dematerialises with Archie inside.
         if self.exit_demat_t0 is not None and self.card_t0 is None:
             t = now - self.exit_demat_t0
-            fade = max(0.0, min(1.0, t / 400.0, (self.demat_len + EXIT_CARD_GAP_MS - t) / 500.0))
-            self._banner(screen, "Level complete!", (255, 236, 170), fade, 90)
+            fade = max(0.0, min(1.0, t / COMPLETE_FADE_IN_MS,
+                                (self.demat_len + EXIT_CARD_GAP_MS - t) / COMPLETE_FADE_OUT_MS))
+            level = int(round(fade * (len(self.complete_fades) - 1)))
+            if level > 0:
+                img = self.complete_fades[level]
+                screen.blit(img, ((WIN_W - img.get_width()) // 2, int(WIN_H * COMPLETE_Y)))
 
     def _draw_card(self, screen, now: float):
         """Fade to black, "Level N", fade into the new maze."""
@@ -2325,11 +2411,12 @@ class Game:
         gap = 10
         width = max(title.get_width(), sub.get_width()) + 56
         height = title.get_height() + sub.get_height() + gap + 36
-        panel = pygame.Surface((width, height), pygame.SRCALPHA)
+        panel = _new_rgba((width, height))
         panel.fill((36, 24, 16, 255))
         pygame.draw.rect(panel, (212, 170, 90), panel.get_rect(), 2)
         panel.blit(title, ((width - title.get_width()) // 2, 16))
         panel.blit(sub, ((width - sub.get_width()) // 2, 16 + title.get_height() + gap))
+        panel = _finish_rgba(panel)
         screen.blit(panel, ((WIN_W - width) // 2, (WIN_H - height) // 2))
 
 
