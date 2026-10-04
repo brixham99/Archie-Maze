@@ -17,8 +17,10 @@ import random
 import sys
 import time
 
-# No audio device is required, and a missing one should not abort headless runs.
-os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+# Headless runs (dummy video) need no audio device either. Normal runs use
+# the real sound card; if the mixer cannot start, the game just stays silent.
+if os.environ.get("SDL_VIDEODRIVER") == "dummy":
+    os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import numpy as np
 import pygame
@@ -80,7 +82,7 @@ TARDIS_FILE = os.path.join(HERE, "assets", "tardis.png")
 # --- Daleks, the TARDIS and the hedge disguise (pre-zoom pixels, ms) ---
 DALEK_H = 86                 # Archie is SPRITE_H = 74
 TARDIS_H = 124
-N_DALEKS = 2
+NUM_DALEKS = 3
 DALEK_STEP_MS = 260          # per cell, gliding; Archie takes MOVE_MS = 150
 DALEK_TURN_MS = 160          # pause when a Dalek changes direction
 DALEK_SIGHT = 8              # cells along the corridor it is facing
@@ -98,7 +100,25 @@ DISGUISE_SCALE = 0.86
 # mirror images of SE/NE, so their points are mirrored at load time.
 DALEK_GUN_SRC = {"se": (95, 76), "ne": (103, 47)}
 DALEK_EYE_SRC = {"se": (79, 30), "ne": (77, 5)}
+DALEK_SPACING = (12, 10, 8, 6, 4, 2)  # wanted gap between Daleks, relaxed in turn
 DISGUISE_KEYS = (pygame.K_h, pygame.K_LSHIFT, pygame.K_RSHIFT)
+MUTE_KEY = pygame.K_m
+
+# --- Sound effects (assets/sounds, made by tools/make_sounds.py) ---
+SOUND_DIR = os.path.join(HERE, "assets", "sounds")
+SOUND_FILES = {
+    "ow": "ow.wav",
+    "exterminate": "exterminate.wav",
+    "laser": "laser.wav",
+    "step1": "step1.wav",
+    "step2": "step2.wav",
+    "step3": "step3.wav",
+}
+SOUND_VOLUME = {"ow": 0.75, "exterminate": 0.9, "laser": 0.7, "step1": 0.45, "step2": 0.45, "step3": 0.45}
+STEP_SOUNDS = ("step1", "step2", "step3")
+OW_COOLDOWN_MS = 900         # holding a key into a hedge doesn't spam "ow"
+MIXER_FREQ = 22050
+MIXER_BUFFER = 512           # ~23 ms at 22050 Hz: small, so sounds aren't laggy
 RESTART_KEYS = (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_r, pygame.K_SPACE)
 
 KEY_ACTIONS = {
@@ -615,6 +635,83 @@ def _make_glow(radius: int, colour):
     return pygame.surfarray.make_surface(img.transpose(1, 0, 2).astype(np.uint8)).convert()
 
 
+class Sounds:
+    """Small, fail-safe wrapper round pygame.mixer.
+
+    If the mixer cannot start or a file is missing, play() is a no-op, so the
+    game runs silently instead of crashing. `requested` counts every event
+    (handy for tests); `played` counts the ones actually sent to the mixer.
+    """
+
+    def __init__(self):
+        self.ok = False
+        self.muted = False
+        self.sounds = {}
+        self.requested = {}
+        self.played = {}
+        self.last_step = None
+        self._rng = random.Random(4)
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(MIXER_FREQ, -16, 2, MIXER_BUFFER)
+            self.ok = bool(pygame.mixer.get_init())
+        except Exception:
+            self.ok = False
+        if not self.ok:
+            return
+        try:
+            pygame.mixer.set_num_channels(16)
+        except Exception:
+            pass
+        for name, filename in SOUND_FILES.items():
+            try:
+                snd = pygame.mixer.Sound(os.path.join(SOUND_DIR, filename))
+                snd.set_volume(SOUND_VOLUME.get(name, 0.8))
+                self.sounds[name] = snd
+            except Exception:
+                pass  # missing or unreadable: that one stays silent
+
+    def length_ms(self, name: str, default: float) -> float:
+        snd = self.sounds.get(name)
+        try:
+            return snd.get_length() * 1000.0 if snd is not None else default
+        except Exception:
+            return default
+
+    def play(self, name: str) -> bool:
+        self.requested[name] = self.requested.get(name, 0) + 1
+        if self.muted or not self.ok:
+            return False
+        snd = self.sounds.get(name)
+        if snd is None:
+            return False
+        try:
+            snd.play()
+        except Exception:
+            return False
+        self.played[name] = self.played.get(name, 0) + 1
+        return True
+
+    def step(self) -> bool:
+        """A soft footstep, never the same sample twice running."""
+        choices = [n for n in STEP_SOUNDS if n != self.last_step]
+        self.last_step = self._rng.choice(choices)
+        return self.play(self.last_step)
+
+    def stop_all(self):
+        if not self.ok:
+            return
+        try:
+            pygame.mixer.stop()
+        except Exception:
+            pass
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if self.muted:
+            self.stop_all()
+
+
 class Dalek:
     """Glides cell to cell along corridors; looks only the way it faces."""
 
@@ -717,10 +814,15 @@ class Game:
         self.font_hud = load_font(16)
         self.cam = (0.0, 0.0)
         self.archie_feet = (0, 0)
+        self.sfx = Sounds()
         self.given_seed = seed
         self.reset(seed if seed is not None else (time.time_ns() & 0x7FFFFFFF))
 
     def reset(self, seed: int):
+        self.sfx.stop_all()
+        self.ow_t = -1e9
+        self.voice_until = -1e9
+        self.hops_heard = 0
         self.seed = seed & 0x7FFFFFFF
         self.grid = generate_maze(MAZE_SIZE, self.seed)
         self.hedge_variant = hedge_variant_grid(self.grid, self.seed)
@@ -774,15 +876,28 @@ class Game:
         rng = random.Random((self.seed * 2654435761 + 12345) & 0xFFFFFFFF)
         from_start = self._path_dist((1, 1))
         from_exit = self._path_dist(self.exit_cell)
-        cands = sorted(
-            cell for cell, d in from_start.items()
-            if d >= DALEK_MIN_START_DIST
-            and from_exit.get(cell, 0) >= DALEK_MIN_EXIT_DIST
-            and self.grid[cell[1]][cell[0]] == PATH
-        )
+        # The full rule is >= 12 cells from the start and >= 10 from the exit;
+        # a small maze that cannot fit them all relaxes those distances.
+        cands = []
+        for k in (1.0, 0.75, 0.5, 0.25, 0.0):
+            cands = sorted(
+                cell for cell, d in from_start.items()
+                if d >= DALEK_MIN_START_DIST * k
+                and from_exit.get(cell, 0) >= DALEK_MIN_EXIT_DIST * k
+                and self.grid[cell[1]][cell[0]] == PATH
+                and cell != (1, 1)
+            )
+            if len(cands) >= NUM_DALEKS:
+                break
         chosen = []
-        for _ in range(N_DALEKS):
-            pool = [c for c in cands if all(abs(c[0] - o[0]) + abs(c[1] - o[1]) >= 10 for o in chosen)]
+        for _ in range(NUM_DALEKS):
+            # Well apart if the maze allows it; relax the spacing step by step.
+            pool = []
+            for gap in DALEK_SPACING:
+                pool = [c for c in cands if c not in chosen
+                        and all(abs(c[0] - o[0]) + abs(c[1] - o[1]) >= gap for o in chosen)]
+                if pool:
+                    break
             pool = pool or [c for c in cands if c not in chosen]
             if not pool:
                 break
@@ -853,6 +968,7 @@ class Game:
             d.state = "aim"
             d.aim_t0 = now
             d.fire_at = now + DALEK_TELEGRAPH_MS + (DALEK_TURN_MS if turned else 0)
+            self._shout(now)
             return False
         d.target = n
         if turned:
@@ -876,6 +992,7 @@ class Game:
                 d.state = "aim"
                 d.aim_t0 = now
                 d.fire_at = now + DALEK_TELEGRAPH_MS
+                self._shout(now)
                 continue
             if now < d.wait_until:
                 continue
@@ -897,9 +1014,17 @@ class Game:
                         d.pos[1] += math.copysign(move, dy)
                     break
 
+    def _shout(self, now: float):
+        """'Exterminate!' as the telegraph starts; one voice at a time."""
+        if now < self.voice_until:
+            return
+        self.voice_until = now + self.sfx.length_ms("exterminate", 1600.0)
+        self.sfx.play("exterminate")
+
     def _kill(self, now: float, shooter: Dalek):
         if self.dead or self.won:
             return
+        self.sfx.play("laser")
         self.dead_pos = self.visual_pos(now)
         self.dead = True
         self.death_t0 = now
@@ -1076,6 +1201,10 @@ class Game:
             if self.bump_dir != (dc, dr):
                 self.bump_dir = (dc, dr)
                 self.bump_t0 = now
+                # "Ow" only for hedges (not for bumping into a Dalek's cell).
+                if not self.is_open(nc, nr) and now - self.ow_t >= OW_COOLDOWN_MS:
+                    self.ow_t = now
+                    self.sfx.play("ow")
             return False
         self.bump_dir = None
         self.queued = None
@@ -1083,6 +1212,7 @@ class Game:
         self.dst = (nc, nr)
         self.move_t0 = now
         self.moving = True
+        self.hops_heard = 0
         return True
 
     def try_action(self, action, now: float) -> bool:
@@ -1135,6 +1265,9 @@ class Game:
     def on_key(self, key: int, now: float):
         if key in RESTART_KEYS and (self.won or (self.dead and now - self.death_t0 >= LASER_MS)):
             self.reset(time.time_ns() & 0x7FFFFFFF)
+            return
+        if key == MUTE_KEY:
+            self.sfx.toggle_mute()
             return
         if key in DISGUISE_KEYS:
             self.toggle_disguise(now)
@@ -1191,7 +1324,14 @@ class Game:
             return
         if not self.moving:
             return
+        # One soft footstep as each half-tile hop lands (two per tile).
+        if self.hops_heard == 0 and now - self.move_t0 >= MOVE_MS / 2:
+            self.hops_heard = 1
+            self.sfx.step()
         if now - self.move_t0 >= MOVE_MS:
+            if self.hops_heard < 2:
+                self.hops_heard = 2
+                self.sfx.step()
             self.col, self.row = self.dst
             self.moving = False
             if self.grid[self.row][self.col] == EXIT:
@@ -1578,7 +1718,10 @@ class Game:
         screen.blit(box, (x, 14))
 
     def _draw_hint(self, screen):
-        text = self.font_hint.render("Left and right to turn. Up to step forward. H to hide as a hedge", True, (240, 234, 214))
+        mute = "M to unmute" if self.sfx.muted else "M to mute"
+        text = self.font_hint.render(
+            f"Left and right to turn. Up to step forward. H to hide as a hedge. {mute}", True, (240, 234, 214)
+        )
         pad_x, pad_y = 12, 8
         box = pygame.Surface((text.get_width() + pad_x * 2, text.get_height() + pad_y * 2), pygame.SRCALPHA)
         box.fill((36, 24, 16, 180))
@@ -1614,6 +1757,10 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        pygame.mixer.pre_init(MIXER_FREQ, -16, 2, MIXER_BUFFER)
+    except Exception:
+        pass
     pygame.init()
     pygame.display.set_caption("Archie's Hedge Maze")
     screen = pygame.display.set_mode((WIN_W, WIN_H))
