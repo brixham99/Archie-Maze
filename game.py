@@ -490,12 +490,20 @@ class Game:
                 return
             self._fire_queued(now)
 
+    def _step_u(self, now: float) -> float:
+        """One cell, covered as two half-tile hops."""
+        t = (now - self.move_t0) / MOVE_MS
+        t = max(0.0, min(1.0, t))
+        if t < 0.5:
+            return ease(t / 0.5) * 0.5
+        return 0.5 + ease((t - 0.5) / 0.5) * 0.5
+
     def visual_pos(self, now: float):
         if self.moving:
-            t = ease((now - self.move_t0) / MOVE_MS)
+            u = self._step_u(now)
             sc, sr = self.src
             dc, dr = self.dst
-            return sc + (dc - sc) * t, sr + (dr - sr) * t
+            return sc + (dc - sc) * u, sr + (dr - sr) * u
         if self.bump_dir is not None:
             t = (now - self.bump_t0) / BUMP_MS
             if t < 1.0:
@@ -537,8 +545,9 @@ class Game:
         feet_sx = int(round(feet_x - cam_x))
         feet_sy = int(round(feet_y - cam_y))
         if self.moving:
-            t = (now - self.move_t0) / MOVE_MS
-            feet_sy -= int(round(math.sin(max(0.0, min(1.0, t)) * math.pi) * 3))
+            t = max(0.0, min(1.0, (now - self.move_t0) / MOVE_MS))
+            local = (t * 2.0) % 1.0 if t < 1.0 else 0.0
+            feet_sy -= int(round(math.sin(local * math.pi) * 2))
         # One pass, back to front. Archie slots in when tiles in front start.
         char_depth = vrow + vcol
         drew = False
