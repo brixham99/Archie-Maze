@@ -300,15 +300,17 @@ def _circular_band(n, rng, fc, width_oct, tilt=0.0):
 
 
 def make_dalek_hum() -> np.ndarray:
-    """A 2 s seamless loop: a throbbing electronic glide hum.
+    """A 2 s seamless loop: a throbbing electronic glide hum, pitched so that
+    laptop and phone speakers (which drop everything below ~200 Hz) play it.
 
-    Detuned band-limited saws and a soft square, built partial by partial
-    through a resonant low-pass whose cutoff sweeps up and down twice per
-    loop, a gentle 4 Hz throb, an FM / ring-mod shimmer and only a trace of
-    breathy noise. Every frequency, sweep and wobble has a whole number of
-    cycles in 2 s, so the end runs straight into the start with no click.
+    Detuned saws at 110/111 Hz, a square at 165 Hz and a saw an octave up,
+    built partial by partial (random partial phases keep the peaks low)
+    through a resonant low-pass sweeping 400 -> 2500 Hz and back twice per
+    loop, with a 150 Hz high-pass, a 4 Hz throb, an FM shimmer and a
+    sweeping electronic whoosh. Every frequency, sweep and wobble has a whole
+    number of cycles in 2 s, so the end runs straight into the start.
     """
-    rng = np.random.default_rng(77)
+    rng = np.random.default_rng(78)
     dur = 2.0
     n = int(dur * SR)
     t = np.arange(n) / SR
@@ -316,38 +318,33 @@ def make_dalek_hum() -> np.ndarray:
     def lfo(cycles_per_loop, phase=0.0):
         return np.sin(2 * np.pi * cycles_per_loop / dur * t + phase)
 
-    # Resonant low-pass sweeping 260 -> 1100 Hz and back, twice per loop.
-    fc = 260.0 * (1100.0 / 260.0) ** (0.5 + 0.5 * lfo(2, -np.pi / 2))
-    q = 4.5
+    sweep = 0.5 + 0.5 * lfo(2, -np.pi / 2)        # 0..1, twice per loop
+    fc = 400.0 * (2500.0 / 400.0) ** sweep        # resonant low-pass cutoff
+    q = 5.0
 
-    def lowpass_gain(f):
+    def gain(f):
         r = f / fc
-        return 1.0 / np.sqrt((1.0 - r * r) ** 2 + (r / q) ** 2)
+        lp = 1.0 / np.sqrt((1.0 - r * r) ** 2 + (r / q) ** 2)
+        hp = f / np.sqrt(f * f + 150.0 ** 2)
+        return lp * hp
 
     synth = np.zeros(n)
-    # Two detuned saws (55 and 56 Hz beat once a second) plus a soft square at 82.5 Hz.
-    for f0, amp, odd_only, ph0 in ((55.0, 1.0, False, 0.0), (56.0, 0.8, False, 1.3), (82.5, 0.35, True, 2.1)):
+    for f0, amp, odd_only in ((110.0, 1.0, False), (111.0, 0.85, False), (165.0, 0.45, True), (220.5, 0.35, False)):
         k = 1
-        while k * f0 < 4000.0:
+        while k * f0 < 6000.0:
             if not odd_only or k % 2 == 1:
                 f = k * f0
-                synth += amp / k * lowpass_gain(f) * np.sin(2 * np.pi * f * t + ph0 * k)
+                synth += amp / k * gain(f) * np.sin(2 * np.pi * f * t + rng.uniform(0, 2 * np.pi))
             k += 1
     synth /= np.sqrt(np.mean(synth ** 2))
-    # (No saturation: when the detuned saws line up once a second, clipping
-    # their peak would add a sharp tick. The resonant filter keeps it soft.)
-    # Throb: a gentle 4 Hz pulse (8 per loop), deeper as the filter opens.
-    throb = 0.78 + 0.22 * lfo(8) * (0.6 + 0.4 * lfo(2, -np.pi / 2))
+    throb = 0.72 + 0.28 * lfo(8) * (0.55 + 0.45 * sweep)          # 4 Hz pulse
     synth *= throb
-    # Shimmer: an FM bell tone ring-modulated by a slow sine, faint.
-    fm = np.sin(2 * np.pi * 990.0 * t + 1.8 * np.sin(2 * np.pi * 165.0 * t))
-    shimmer = fm * np.sin(2 * np.pi * 3.5 * t) * (0.5 + 0.5 * lfo(2, 0.8))
-    # Low sub to keep the mechanical weight, and a trace of electronic whoosh.
-    sub = np.sin(2 * np.pi * 27.5 * t) * 0.5
-    whoosh = _circular_band(n, rng, 900.0, 0.5) * (0.5 + 0.5 * lfo(2, -np.pi / 2))
-    x = synth + 0.10 * shimmer + 0.35 * sub + 0.07 * whoosh
-    x = x / np.sqrt(np.mean(x ** 2)) * 0.10  # about -20 dBFS RMS
-    return np.clip(x, -0.6, 0.6)
+    fm = np.sin(2 * np.pi * 1320.0 * t + 1.5 * np.sin(2 * np.pi * 165.0 * t))
+    shimmer = fm * (0.55 + 0.45 * lfo(7)) * (0.4 + 0.6 * sweep)    # 3.5 Hz flutter
+    whoosh = _circular_band(n, rng, 1300.0, 0.45) * (0.35 + 0.65 * sweep)
+    x = synth + 0.16 * shimmer + 0.14 * whoosh
+    x = x / np.sqrt(np.mean(x ** 2)) * 0.20  # about -14 dBFS RMS
+    return np.clip(x, -0.95, 0.95)
 
 
 def _swept_noise(n, rng, fc_of_t, width_oct):
@@ -508,11 +505,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--spectrograms", default=None, help="also write spectrogram PNGs here")
+    ap.add_argument("--overwrite-tardis", action="store_true",
+                    help="replace an existing tardis_demat.wav (it may be a real clip you supplied) with ours")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     for name, fn in SOUNDS.items():
-        x = fn()
         path = os.path.join(args.out, f"{name}.wav")
+        if name == "tardis_demat" and os.path.exists(path) and not args.overwrite_tardis:
+            print(f"{name:12s} kept the existing {os.path.relpath(path)} (use --overwrite-tardis to replace it)")
+            continue
+        x = fn()
         write_wav(path, x)
         rms = float(np.sqrt(np.mean(x ** 2)))
         print(f"{name:12s} {len(x) / SR:5.2f} s  peak {np.max(np.abs(x)):.2f}  rms {rms:.3f}  -> {os.path.relpath(path)}")

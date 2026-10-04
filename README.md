@@ -1,6 +1,6 @@
 # Archie Maze
 
-An isometric hedge maze. Archie stays in the middle of the screen and the maze stays flat. Three Daleks roam the hedges; reach the TARDIS in the far corner to escape.
+An isometric hedge maze. Archie stays in the middle of the screen and the maze stays flat. Daleks roam the hedges; reach the TARDIS in the far corner to escape to the next level, where there is a new maze and more Daleks.
 
 ## Play
 
@@ -16,17 +16,32 @@ python3 game.py
 | Down / S | Step back |
 | H (or Shift) | Hide as a hedge for up to 4 s (press again to stop early); 3 s to recharge |
 | M | Mute / unmute the sound |
-| Enter, R or Space | New maze after you win or are exterminated |
+| Enter, R or Space | After you are exterminated: try the same level again in a new maze |
 | Esc | Quit |
 
 A Dalek sees Archie only along the corridor it is facing, up to 8 cells away with no hedge in between. It shouts, its eye stalk glows, and a moment later it fires. Daleks cannot see a hedge, and they turn away if one is in their path.
 
 You can hear a Dalek coming: it hums as it glides, faintly from about 14 cells away and louder the closer it is (distance through the maze counts most, since hedges muffle it). The hum stops briefly while it turns or stands still.
 
-Each game starts with the TARDIS that dropped Archie off standing behind him. After 5 seconds it dematerialises, fading in and out over about 3.5 s. You can start walking straight away.
+## Levels
+
+Level N has 3 + 2 × (N − 1) Daleks, up to a maximum of 15:
+
+| Level | 1 | 2 | 3 | 4 | 5 | 6 | 7 and up |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Daleks | 3 | 5 | 7 | 9 | 11 | 13 | 15 |
+
+The maze stays 41 × 41. Daleks start at least 12 cells (along the paths) from Archie's start and 10 from the TARDIS, and well apart from each other. If the maze cannot fit them all, the gap between Daleks is relaxed a step at a time.
+
+When Archie reaches the TARDIS, the controls lock and the Daleks freeze (their hum fades). The door opens and Archie walks in and disappears inside. The TARDIS then dematerialises with the same animation and sound as at the start ("Level complete!"). Then a short "Level N" card is shown, and the next level begins in a brand-new maze. The current level and the number of Daleks are shown in the top-left corner.
+
+If a Dalek exterminates Archie, press Enter, R or Space to try the same level again in a new maze.
+
+Each level starts with the TARDIS that dropped Archie off standing behind him. After 5 seconds it dematerialises, fading in and out for as long as the TARDIS sound lasts (about 6.6 s with the supplied clip). You can start walking straight away.
 
 ```bash
-python3 game.py --seed 1
+python3 game.py --seed 1      # a fixed first maze
+python3 game.py --level 4     # start on level 4 (9 Daleks)
 ```
 
 ## Sound
@@ -42,8 +57,8 @@ All sounds are small WAV files in `assets/sounds/` (22050 Hz, 16-bit mono):
 | `exterminate.wav` | A Dalek spots Archie | espeak-ng, one syllable at a time (EX-TER-MIN-ATE!), then a 30 Hz ring modulator, distortion and a short metallic echo |
 | `laser.wav` | The Dalek fires | Synthesised: a descending zap with buzz and crackle |
 | `step1.wav`, `step2.wav`, `step3.wav` | One soft footstep per half-tile hop, varied | Synthesised: a low thump plus a little gravel crunch |
-| `dalek_hum.wav` | Loops on its own channel for each Dalek gliding within about 14 cells, faint far off and louder up close, panned a little left or right; it fades out while the Dalek turns or stands still | Synthesised 2 s seamless loop: detuned saw and square oscillators (55, 56 and 82.5 Hz) through a resonant filter that sweeps twice per loop, a 4 Hz throb, a faint FM shimmer and a low sub |
-| `tardis_demat.wav` | The TARDIS dematerialises, 5 s into each game | Synthesised, an original wheeze-groan: three rising-and-falling grinding groans (noisy harmonics on a gliding pitch, a sweeping breathy band, ring-modulated metallic overtones) with reverb and a soft thud as it vanishes, timed to the fade pulses |
+| `dalek_hum.wav` | Loops for each Dalek gliding within about 14 cells, faint far off and louder up close, panned a little left or right; it fades out while the Dalek turns or stands still. Four mixer channels carry the hums of the four loudest Daleks | Synthesised 2 s seamless loop: detuned saw and square oscillators (110, 111, 165 and 220.5 Hz) through a resonant filter sweeping 400 to 2500 Hz twice per loop, a 4 Hz throb, an FM shimmer and an electronic whoosh. Pitched so laptop speakers can play it |
+| `tardis_demat.wav` | The TARDIS dematerialises, 5 s into each level, and again when Archie leaves in it | A supplied recording. `tools/make_sounds.py` can also synthesise an original wheeze-groan here (three rising-and-falling grinding groans with ring-modulated metallic overtones, reverb and a soft thud), but it keeps an existing file unless you pass `--overwrite-tardis` |
 
 To regenerate them (needs numpy; the two voices also need `espeak-ng`, for example `sudo apt install espeak-ng`):
 
@@ -63,4 +78,11 @@ SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --screenshot shot.png --frames 20
 SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --scene laser --screenshot laser.png
 ```
 
-Scenes: `dalek`, `laser`, `telegraph`, `disguise`, `tardis`, `tardis_demat`. Add `--scene-ms N` to choose how far into the scene the shot is taken, for example `--scene tardis_demat --scene-ms 6500` (the TARDIS waits 5 s, so that is 1.5 s into the dematerialisation).
+Scenes: `dalek`, `laser`, `telegraph`, `disguise`, `tardis`, `tardis_demat`, `tardis_exit`. Add `--scene-ms N` to choose how far into the scene the shot is taken, for example `--scene tardis_demat --scene-ms 6500` (the TARDIS waits 5 s, so that is 1.5 s into the dematerialisation).
+
+`tardis_exit` puts Archie next to the TARDIS and steps him in. Use `--scene-ms` to follow the whole exit sequence. With a 6.6 s TARDIS sound: the door opens and Archie goes in over 0 to 1.3 s, the dematerialisation runs from 1.75 s to about 8.4 s, the "Level 2" card from about 8.6 to 10.5 s, and level 2 starts after that.
+
+```bash
+SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --scene tardis_exit --scene-ms 700 --screenshot exit.png
+SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --level 5 --scene laser --screenshot laser5.png
+```
