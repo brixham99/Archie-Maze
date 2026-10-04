@@ -31,7 +31,10 @@ All sounds are small WAV files in `assets/sounds/` (22050 Hz, 16-bit mono):
 
 | File | When it plays | How it was made |
 | --- | --- | --- |
-| `ow.wav` | Archie bumps into a hedge (at most about once a second while you hold the key) | espeak-ng "Ouw!" in a light voice, sped up into a boy's pitch |
+| `ow.wav` | Archie bumps into a hedge for the 3rd time within 2 seconds (held-key bumps count too), played quietly. A single bump is silent apart from the rustle | espeak-ng "Ouw!" in a light voice, sped up into a boy's pitch |
+| `rustle.wav` | A very soft leafy rustle on the other hedge bumps | Synthesised: a few filtered leafy noise grains over a gentle low thud |
+| `cloak_on.wav` | The hedge disguise starts (also when it kicks in after a hop lands) | Synthesised: a quick rising run of wind-chime bells (C6 to E7, pentatonic) over a fluttering shimmer, about 0.46 s |
+| `cloak_off.wav` | The hedge disguise ends (time runs out or H is pressed again) | Synthesised: the same chimes as a falling run, about 0.46 s |
 | `exterminate.wav` | A Dalek spots Archie | espeak-ng, one syllable at a time (EX-TER-MIN-ATE!), then a 30 Hz ring modulator, distortion and a short metallic echo |
 | `laser.wav` | The Dalek fires | Synthesised: a descending zap with buzz and crackle |
 | `step1.wav`, `step2.wav`, `step3.wav` | One soft footstep per half-tile hop, varied | Synthesised: a low thump plus a little gravel crunch |

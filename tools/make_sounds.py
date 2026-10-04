@@ -226,6 +226,68 @@ def make_step(seed: int, pitch: float) -> np.ndarray:
     return fade(normalise(x, 0.30), 0.001, 0.03)
 
 
+def make_rustle() -> np.ndarray:
+    """A tiny, soft leafy rustle for a single bump into a hedge."""
+    rng = np.random.default_rng(77)
+    dur = 0.16
+    n = int(dur * SR)
+    t = np.arange(n) / SR
+    grains = np.zeros(n)
+    for _ in range(int(rng.integers(40, 55))):
+        p = int(rng.beta(1.4, 2.6) * 0.13 * SR)
+        length = int(rng.integers(20, 70))
+        burst = rng.uniform(-1, 1, length) * np.exp(-np.arange(length) / (length / 3))
+        end = min(n, p + length)
+        grains[p:end] += burst[: end - p] * rng.uniform(0.2, 1.0)
+    leaves = biquad_bp(grains, 3600.0, 0.7)
+    body = onepole_lp(onepole_lp(rng.uniform(-1, 1, n), 300.0), 300.0)
+    body = normalise(body, 1.0) * np.exp(-t / 0.03) * np.minimum(1.0, t / 0.004)
+    env = np.minimum(1.0, t / 0.01) * np.exp(-t / 0.06)
+    x = normalise(leaves, 1.0) * env * 0.8 + body * 0.35
+    return fade(normalise(x, 0.35), 0.002, 0.03)
+
+
+def _chime(freq: float, dur: float, tau: float, rng) -> np.ndarray:
+    """One small inharmonic bell/chime strike."""
+    n = int(dur * SR)
+    t = np.arange(n) / SR
+    out = np.zeros(n)
+    for ratio, amp in ((1.0, 1.0), (2.756, 0.38), (5.404, 0.14), (8.93, 0.05)):
+        f = freq * ratio * (1 + rng.uniform(-0.004, 0.004))
+        out += amp * np.sin(2 * np.pi * f * t + rng.uniform(0, 2 * np.pi)) * np.exp(-t * ratio ** 0.5 / tau)
+    return out * np.minimum(1.0, t / 0.002)
+
+
+def make_cloak(rising: bool) -> np.ndarray:
+    """Sped-up wind chime / teleport shimmer: a run of chimes and a sparkle."""
+    rng = np.random.default_rng(31 if rising else 47)
+    dur = 0.46
+    n = int(dur * SR)
+    t = np.arange(n) / SR
+    # Pentatonic run C6..E7 (rising) or the reverse (falling).
+    notes = [1046.5, 1174.7, 1318.5, 1568.0, 1760.0, 2093.0, 2349.3, 2637.0]
+    if not rising:
+        notes = notes[::-1]
+    x = np.zeros(n)
+    spacing = 0.034
+    for i, f in enumerate(notes):
+        start = int((i * spacing + rng.uniform(0, 0.006)) * SR)
+        c = _chime(f, dur, 0.075, rng) * (0.75 + 0.25 * rng.random())
+        x[start:] += c[: n - start]
+    # Airy shimmer: high noise with a fast flutter, swelling over the run.
+    noise = onepole_hp(rng.uniform(-1, 1, n), 5000.0)
+    flutter = 0.5 + 0.5 * np.sin(2 * np.pi * 38.0 * t)
+    swell = np.sin(np.pi * np.clip(t / 0.36, 0, 1)) ** 2
+    x += normalise(noise, 1.0) * flutter * swell * 0.18
+    # A soft sweep underneath (up for on, down for off).
+    f0, f1 = (500.0, 1500.0) if rising else (1500.0, 500.0)
+    sweep_f = f0 * (f1 / f0) ** np.clip(t / 0.34, 0, 1)
+    sweep = np.sin(2 * np.pi * np.cumsum(sweep_f) / SR) * swell * 0.12
+    x += sweep
+    x = onepole_lp(x, 9000.0)
+    return fade(normalise(x, 0.7), 0.002, 0.06)
+
+
 SOUNDS = {
     "exterminate": make_exterminate,
     "laser": make_laser,
@@ -233,6 +295,9 @@ SOUNDS = {
     "step1": lambda: make_step(101, 1.0),
     "step2": lambda: make_step(202, 0.88),
     "step3": lambda: make_step(303, 1.12),
+    "rustle": make_rustle,
+    "cloak_on": lambda: make_cloak(True),
+    "cloak_off": lambda: make_cloak(False),
 }
 
 
@@ -288,7 +353,7 @@ def main():
         write_wav(path, x)
         rms = float(np.sqrt(np.mean(x ** 2)))
         print(f"{name:12s} {len(x) / SR:5.2f} s  peak {np.max(np.abs(x)):.2f}  rms {rms:.3f}  -> {os.path.relpath(path)}")
-        if args.spectrograms and name in ("exterminate", "laser", "ow"):
+        if args.spectrograms and name in ("exterminate", "laser", "ow", "cloak_on", "cloak_off", "rustle"):
             os.makedirs(args.spectrograms, exist_ok=True)
             spectrogram_png(x, os.path.join(args.spectrograms, f"spec_{name}.png"), name)
 

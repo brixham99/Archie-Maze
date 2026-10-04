@@ -92,6 +92,10 @@ DALEK_MIN_EXIT_DIST = 10     # path distance from the exit
 LASER_MS = 450               # how long the beam stays on screen
 DEATH_FADE_MS = 900          # Archie flickers, whites out and fades
 DEATH_MSG_MS = 1000          # then the EXTERMINATED! panel
+DEATH_FADE_LEVELS = 16
+FLASH_MS = 200               # subtle translucent white flash on the shot
+FLASH_ALPHA = 70             # of 255, at its peak
+PUFF_LEVELS = 12
 DISGUISE_MS = 4000
 DISGUISE_COOLDOWN_MS = 3000
 POOF_MS = 280
@@ -114,9 +118,18 @@ SOUND_FILES = {
     "step2": "step2.wav",
     "step3": "step3.wav",
 }
-SOUND_VOLUME = {"ow": 0.75, "exterminate": 0.9, "laser": 0.7, "step1": 0.45, "step2": 0.45, "step3": 0.45}
+SOUND_FILES.update({"rustle": "rustle.wav", "cloak_on": "cloak_on.wav", "cloak_off": "cloak_off.wav"})
+SOUND_VOLUME = {
+    "ow": 0.38, "exterminate": 0.9, "laser": 0.7,
+    "step1": 0.45, "step2": 0.45, "step3": 0.45,
+    "rustle": 0.30, "cloak_on": 0.5, "cloak_off": 0.5,
+}
 STEP_SOUNDS = ("step1", "step2", "step3")
-OW_COOLDOWN_MS = 900         # holding a key into a hedge doesn't spam "ow"
+OW_BUMPS = 3                 # "ow" on the 3rd hedge bump ...
+OW_WINDOW_MS = 2000          # ... within 2 s; single bumps only rustle
+OW_QUIET_MS = 2000           # after an "ow", bumps just rustle for a while
+BUMP_COUNT_GAP_MS = 250      # held-key repeats count, but at most 4 a second
+RUSTLE_GAP_MS = 450          # the soft rustle at most about twice a second
 MIXER_FREQ = 22050
 MIXER_BUFFER = 512           # ~23 ms at 22050 Hz: small, so sounds aren't laggy
 RESTART_KEYS = (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_r, pygame.K_SPACE)
@@ -625,6 +638,24 @@ def _load_scaled(path: str, height: int):
     return src, pygame.transform.smoothscale(src, (w, height)), k
 
 
+def _alpha_scaled(image: pygame.Surface, k: float) -> pygame.Surface:
+    """Copy of a per-pixel-alpha surface with its alpha multiplied by k."""
+    out = image.copy()
+    alpha = pygame.surfarray.pixels_alpha(out)
+    alpha[:] = (pygame.surfarray.array_alpha(image).astype(np.float32) * k).astype(np.uint8)
+    del alpha
+    return out
+
+
+def _faded_silhouettes(image: pygame.Surface, levels: int):
+    """White silhouettes of a sprite: index 0 opaque, the last one invisible."""
+    white = image.copy()
+    rgb = pygame.surfarray.pixels3d(white)
+    rgb[:] = 255
+    del rgb
+    return [_alpha_scaled(white, 1.0 - i / (levels - 1)) for i in range(levels)]
+
+
 def _make_glow(radius: int, colour):
     """Additive radial glow (blit with BLEND_RGB_ADD)."""
     size = radius * 2 + 1
@@ -758,12 +789,11 @@ class Game:
                 image = pygame.transform.smoothscale(image, (w, SPRITE_H))
             self.sprites[key] = image
             self.anchors[key] = _feet_anchor(image)
-        # White silhouettes for the death flicker.
-        self.white = {}
-        for key, image in self.sprites.items():
-            ghost = image.copy()
-            ghost.fill((255, 255, 255), special_flags=pygame.BLEND_RGB_MAX)
-            self.white[key] = ghost
+        # White silhouettes for the death flicker, pre-faded. Built with numpy so
+        # only Archie's own pixels turn white and the alpha is copied exactly
+        # (no blend-mode fills or set_alpha on per-pixel-alpha surfaces, whose
+        # behaviour differs between pygame builds and can whiten the whole rect).
+        self.white = {key: _faded_silhouettes(image, DEATH_FADE_LEVELS) for key, image in self.sprites.items()}
         self.dalek_sprites = {}
         self.dalek_anchor = {}
         self.dalek_gun = {}
@@ -793,12 +823,16 @@ class Game:
         pygame.draw.ellipse(self.scorch, (10, 6, 4, 200), self.scorch.get_rect().inflate(-14, -6))
         self.glow_eye = _make_glow(int(13 * ZOOM), (190, 235, 255))
         self.glow_hit = _make_glow(int(16 * ZOOM), (140, 200, 255))
-        self.puffs = []
+        self.puffs = []  # puffs[size][alpha level], pre-faded
         for radius in (2, 3, 4, 5, 6):
             puff = pygame.Surface((radius * 2 + 2, radius * 2 + 2), pygame.SRCALPHA)
             pygame.draw.circle(puff, (214, 236, 190, 255), (radius + 1, radius + 1), radius)
             pygame.draw.circle(puff, (246, 252, 236, 255), (radius, radius), max(1, radius - 2))
-            self.puffs.append(puff)
+            self.puffs.append([_alpha_scaled(puff, i / (PUFF_LEVELS - 1)) for i in range(PUFF_LEVELS)])
+        # Full-window flash: a plain (no per-pixel alpha) surface, faded with
+        # surface alpha, so it is a translucent wash and never a hard block.
+        self.flash = pygame.Surface((WIN_W, WIN_H)).convert()
+        self.flash.fill((255, 255, 255))
         self.disguise_cache = {}
         self.shadow = pygame.Surface((40, 16), pygame.SRCALPHA)
         pygame.draw.ellipse(self.shadow, (48, 30, 16, 110), self.shadow.get_rect())
@@ -820,7 +854,10 @@ class Game:
 
     def reset(self, seed: int):
         self.sfx.stop_all()
-        self.ow_t = -1e9
+        self.bump_times = []
+        self.last_bump_t = -1e9
+        self.rustle_t = -1e9
+        self.ow_quiet_until = -1e9
         self.voice_until = -1e9
         self.hops_heard = 0
         self.seed = seed & 0x7FFFFFFF
@@ -1051,6 +1088,7 @@ class Game:
         self._start_disguise(now)
 
     def _start_disguise(self, now: float):
+        self.sfx.play("cloak_on")
         self.disguised = True
         self.disguise_t0 = now
         self.disguise_pending = False
@@ -1059,6 +1097,7 @@ class Game:
         self.bump_dir = None
 
     def _end_disguise(self, now: float):
+        self.sfx.play("cloak_off")
         self.disguised = False
         self.disguise_end_t = now
         self.cooldown_until = now + DISGUISE_COOLDOWN_MS
@@ -1201,10 +1240,8 @@ class Game:
             if self.bump_dir != (dc, dr):
                 self.bump_dir = (dc, dr)
                 self.bump_t0 = now
-                # "Ow" only for hedges (not for bumping into a Dalek's cell).
-                if not self.is_open(nc, nr) and now - self.ow_t >= OW_COOLDOWN_MS:
-                    self.ow_t = now
-                    self.sfx.play("ow")
+                if not self.is_open(nc, nr):  # a hedge, not a Dalek's cell
+                    self._hedge_bump(now)
             return False
         self.bump_dir = None
         self.queued = None
@@ -1214,6 +1251,21 @@ class Game:
         self.moving = True
         self.hops_heard = 0
         return True
+
+    def _hedge_bump(self, now: float):
+        """Soft rustle per bump; a quiet 'ow' only on the 3rd bump in 2 s."""
+        if now - self.last_bump_t < BUMP_COUNT_GAP_MS:
+            return
+        self.last_bump_t = now
+        self.bump_times = [t for t in self.bump_times if now - t < OW_WINDOW_MS]
+        self.bump_times.append(now)
+        if len(self.bump_times) >= OW_BUMPS and now >= self.ow_quiet_until:
+            self.bump_times = []
+            self.ow_quiet_until = now + OW_QUIET_MS
+            self.sfx.play("ow")
+        elif now - self.rustle_t >= RUSTLE_GAP_MS:
+            self.rustle_t = now
+            self.sfx.play("rustle")
 
     def try_action(self, action, now: float) -> bool:
         if self.won or self.dead or self.disguised or self.disguise_pending:
@@ -1532,8 +1584,8 @@ class Game:
             r = reach * (0.75 + 0.25 * ((i * 7) % 5) / 4)
             px = fx + math.cos(ang) * r
             py = fy - 18 + math.sin(ang) * r * 0.6
-            puff = self.puffs[max(0, min(4, 4 - int(t * 4) + (i % 2) - 1))]
-            puff.set_alpha(alpha)
+            sizes = self.puffs[max(0, min(4, 4 - int(t * 4) + (i % 2) - 1))]
+            puff = sizes[max(0, min(PUFF_LEVELS - 1, round(alpha / 255 * (PUFF_LEVELS - 1))))]
             screen.blit(puff, (int(px - puff.get_width() / 2), int(py - puff.get_height() / 2)))
 
     def _draw_archie(self, screen, feet_sx: int, feet_sy: int, now: float):
@@ -1544,13 +1596,13 @@ class Game:
         if self.dead:
             t = now - self.death_t0
             screen.blit(self.scorch, (feet_sx - self.scorch.get_width() // 2, feet_sy - 7))
+            ghosts = self.white[key]
             if t < LASER_MS:
-                screen.blit(self.white[key] if int(t / 45) % 2 == 0 else sprite, pos)
+                screen.blit(ghosts[0] if int(t / 45) % 2 == 0 else sprite, pos)
             elif t < DEATH_FADE_MS:
-                ghost = self.white[key]
-                ghost.set_alpha(int(255 * (1.0 - (t - LASER_MS) / (DEATH_FADE_MS - LASER_MS))))
-                screen.blit(ghost, pos)
-                ghost.set_alpha(255)
+                u = (t - LASER_MS) / (DEATH_FADE_MS - LASER_MS)
+                level = max(0, min(len(ghosts) - 1, int(u * (len(ghosts) - 1) + 0.5)))
+                screen.blit(ghosts[level], pos)
             return
         shade = int(round(max(0.0, min(1.0, (feet_sy - TILE_H // 2) / self.view_h)) * (N_HEDGE_SHADES - 1)))
         since_on = now - self.disguise_t0
@@ -1620,9 +1672,9 @@ class Game:
                 fx, fy = self.archie_feet
                 tx, ty = self._to_window(fx, fy - 34)
                 self._draw_laser(screen, (gx, gy), (tx, ty), now, t)
-            if t < 240:
-                a = int(170 * (1.0 - t / 240))
-                screen.fill((a, a, a), special_flags=pygame.BLEND_RGB_ADD)
+            if t < FLASH_MS:
+                self.flash.set_alpha(int(FLASH_ALPHA * (1.0 - t / FLASH_MS) ** 2))
+                screen.blit(self.flash, (0, 0))
 
     def _draw_shout(self, screen, d: Dalek, now: float):
         fx, fy = d.feet
