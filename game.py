@@ -34,6 +34,11 @@ TURN_MS = 220
 BUMP_MS = 110
 WIN_W = 1100
 WIN_H = 720
+# The world (maze, dirt, Archie) is drawn to a smaller internal surface and
+# scaled up to the window, so everything grows together. The HUD (hint,
+# minimap, win panel) is drawn afterwards at full window resolution.
+ZOOM = 2.0
+ZOOM_SMOOTH = False  # True: smoothscale; False: nearest-neighbour scale
 MAZE_SIZE = 41  # odd, so a perfect maze has a solid border
 WALL, PATH, EXIT = 0, 1, 2
 
@@ -551,6 +556,9 @@ class Game:
         pygame.draw.ellipse(self.shadow, (48, 30, 16, 110), self.shadow.get_rect())
         self.dirt = build_dirt_variants(make_dirt_texture())
         self.hedges = build_hedge_variants()
+        self.view_w = max(1, int(round(WIN_W / ZOOM)))
+        self.view_h = max(1, int(round(WIN_H / ZOOM)))
+        self.view = pygame.Surface((self.view_w, self.view_h)).convert()
         self.font_hint = load_font(18)
         self.font_big = load_font(36, bold=True)
         self.font_small = load_font(20)
@@ -765,23 +773,38 @@ class Game:
                 wx, wy = tile_origin(col, row)
                 sx = wx - cam_x
                 sy = wy - cam_y
-                if sx < -margin_x or sx > WIN_W + margin_x:
+                if sx < -margin_x or sx > self.view_w + margin_x:
                     continue
-                if sy > WIN_H + margin_bottom or sy < -margin_top:
+                if sy > self.view_h + margin_bottom or sy < -margin_top:
                     continue
                 tiles.append((float(row + col), col, row, int(round(sx)), int(round(sy))))
         tiles.sort()
         return tiles
 
     def draw(self, screen: pygame.Surface, now: float):
+        view = self.view
+        self._draw_world(view, now)
+        if view.get_size() == screen.get_size():
+            screen.blit(view, (0, 0))
+        elif ZOOM_SMOOTH:
+            pygame.transform.smoothscale(view, screen.get_size(), screen)
+        else:
+            pygame.transform.scale(view, screen.get_size(), screen)
+        # HUD at full window resolution, on top of the scaled world.
+        self._draw_minimap(screen)
+        self._draw_hint(screen)
+        if self.won:
+            self._draw_win(screen)
+
+    def _draw_world(self, screen: pygame.Surface, now: float):
         screen.fill(BG_COLOUR)
         vcol, vrow = self.visual_pos(now)
         feet_x, feet_y = tile_origin(vcol, vrow)
         feet_y += TILE_H // 2
         # Feet sit near the centre; looking a little above them puts his body
         # just above centre. The maze scrolls; tiles are not yaw-rotated.
-        cam_x = feet_x - WIN_W / 2
-        cam_y = (feet_y - 46) - WIN_H / 2
+        cam_x = feet_x - self.view_w / 2
+        cam_y = (feet_y - 46) - self.view_h / 2
         tiles = self._visible_tiles(cam_x, cam_y)
 
         feet_sx = int(round(feet_x - cam_x))
@@ -806,23 +829,19 @@ class Game:
                 self._draw_dirt(screen, col, row, tx, ty)
         if not drew:
             self._draw_archie(screen, feet_sx, feet_sy, now)
-        self._draw_minimap(screen)
-        self._draw_hint(screen)
-        if self.won:
-            self._draw_win(screen)
 
     def _fog(self, colour, sy: int):
         # Slight aerial perspective: tiles higher on the screen are a touch darker.
-        k = 0.88 + 0.14 * max(0.0, min(1.0, sy / WIN_H))
+        k = 0.88 + 0.14 * max(0.0, min(1.0, sy / self.view_h))
         return mix(colour, k)
 
     def _draw_dirt(self, screen, col, row, tx: int, ty: int):
         """Clipped dirt diamond in tile space. Not a rotated sprite."""
         variant = (col * 5 + row * 3 + (col ^ row)) % N_DIRT
         cy = ty + TILE_H // 2
-        if cy < WIN_H * 0.33:
+        if cy < self.view_h * 0.33:
             shade = 0
-        elif cy < WIN_H * 0.66:
+        elif cy < self.view_h * 0.66:
             shade = 1
         else:
             shade = 2
@@ -834,7 +853,7 @@ class Game:
 
     def _draw_hedge(self, screen, col: int, row: int, tx: int, ty: int):
         """Pre-rendered leafy block; same footprint and height as the tile."""
-        k = max(0.0, min(1.0, ty / WIN_H))
+        k = max(0.0, min(1.0, ty / self.view_h))
         shade = int(round(k * (N_HEDGE_SHADES - 1)))
         sprite = self.hedges[self.hedge_variant[row][col]][shade]
         screen.blit(sprite, (tx - HEDGE_OX, ty - HEDGE_OY))
