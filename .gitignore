@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Your own TARDIS sound (not included; see README)
+assets/sounds/tardis_real.*
+
+# Screenshots, spectrograms and previews made while testing
+shot_*.png
+spec_*.png
+*_preview.png

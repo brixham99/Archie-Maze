@@ -300,11 +300,13 @@ def _circular_band(n, rng, fc, width_oct, tilt=0.0):
 
 
 def make_dalek_hum() -> np.ndarray:
-    """A 2 s seamless loop: a breathy glide whoosh over a low mechanical hum.
+    """A 2 s seamless loop: a throbbing electronic glide hum.
 
-    Everything repeats exactly every 2 s: the noise bands are filtered
-    circularly (FFT), and every tone and wobble has a whole number of cycles
-    in 2 s, so the end runs straight into the start with no seam or click.
+    Detuned band-limited saws and a soft square, built partial by partial
+    through a resonant low-pass whose cutoff sweeps up and down twice per
+    loop, a gentle 4 Hz throb, an FM / ring-mod shimmer and only a trace of
+    breathy noise. Every frequency, sweep and wobble has a whole number of
+    cycles in 2 s, so the end runs straight into the start with no click.
     """
     rng = np.random.default_rng(77)
     dur = 2.0
@@ -314,26 +316,36 @@ def make_dalek_hum() -> np.ndarray:
     def lfo(cycles_per_loop, phase=0.0):
         return np.sin(2 * np.pi * cycles_per_loop / dur * t + phase)
 
-    # Low mechanical hum: 75 Hz with harmonics, slight pitch wobble, soft-clipped.
-    f0 = 75.0
-    wob = 0.012 * lfo(3)  # ~1.5 Hz drift in phase, about +-1 Hz
-    hum = np.zeros(n)
-    for k, a in ((1, 1.0), (2, 0.55), (3, 0.32), (4, 0.18), (6, 0.08)):
-        hum += a * np.sin(2 * np.pi * f0 * k * t + k * 2 * np.pi * wob * 4)
-    hum = np.tanh(1.4 * hum / np.max(np.abs(hum)))
-    hum *= 0.85 + 0.15 * lfo(1, 0.4)  # gentle 0.5 Hz throb
-    hum /= np.sqrt(np.mean(hum ** 2))
-    # Glide whoosh: two noise bands that swell in turn, so the hiss seems to move.
-    low = _circular_band(n, rng, 520.0, 0.55)
-    high = _circular_band(n, rng, 1500.0, 0.6, tilt=-0.3)
-    air = _circular_band(n, rng, 3800.0, 0.5)
-    swell = 0.5 + 0.5 * lfo(1)  # 0.5 Hz, one swell per half loop pair
-    whoosh = (0.6 + 0.4 * swell) * low + (0.6 + 0.4 * (1 - swell)) * 0.7 * high
-    whoosh += 0.12 * (0.7 + 0.3 * lfo(2, 1.1)) * air
-    whoosh /= np.sqrt(np.mean(whoosh ** 2))
-    # Faint servo whine, tuned to a whole number of cycles per loop.
-    whine = np.sin(2 * np.pi * 330.0 * t + 0.4 * lfo(2)) * (0.5 + 0.5 * lfo(1, 2.0))
-    x = 0.55 * hum + 0.42 * whoosh + 0.05 * whine
+    # Resonant low-pass sweeping 260 -> 1100 Hz and back, twice per loop.
+    fc = 260.0 * (1100.0 / 260.0) ** (0.5 + 0.5 * lfo(2, -np.pi / 2))
+    q = 4.5
+
+    def lowpass_gain(f):
+        r = f / fc
+        return 1.0 / np.sqrt((1.0 - r * r) ** 2 + (r / q) ** 2)
+
+    synth = np.zeros(n)
+    # Two detuned saws (55 and 56 Hz beat once a second) plus a soft square at 82.5 Hz.
+    for f0, amp, odd_only, ph0 in ((55.0, 1.0, False, 0.0), (56.0, 0.8, False, 1.3), (82.5, 0.35, True, 2.1)):
+        k = 1
+        while k * f0 < 4000.0:
+            if not odd_only or k % 2 == 1:
+                f = k * f0
+                synth += amp / k * lowpass_gain(f) * np.sin(2 * np.pi * f * t + ph0 * k)
+            k += 1
+    synth /= np.sqrt(np.mean(synth ** 2))
+    # (No saturation: when the detuned saws line up once a second, clipping
+    # their peak would add a sharp tick. The resonant filter keeps it soft.)
+    # Throb: a gentle 4 Hz pulse (8 per loop), deeper as the filter opens.
+    throb = 0.78 + 0.22 * lfo(8) * (0.6 + 0.4 * lfo(2, -np.pi / 2))
+    synth *= throb
+    # Shimmer: an FM bell tone ring-modulated by a slow sine, faint.
+    fm = np.sin(2 * np.pi * 990.0 * t + 1.8 * np.sin(2 * np.pi * 165.0 * t))
+    shimmer = fm * np.sin(2 * np.pi * 3.5 * t) * (0.5 + 0.5 * lfo(2, 0.8))
+    # Low sub to keep the mechanical weight, and a trace of electronic whoosh.
+    sub = np.sin(2 * np.pi * 27.5 * t) * 0.5
+    whoosh = _circular_band(n, rng, 900.0, 0.5) * (0.5 + 0.5 * lfo(2, -np.pi / 2))
+    x = synth + 0.10 * shimmer + 0.35 * sub + 0.07 * whoosh
     x = x / np.sqrt(np.mean(x ** 2)) * 0.10  # about -20 dBFS RMS
     return np.clip(x, -0.6, 0.6)
 

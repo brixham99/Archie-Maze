@@ -106,8 +106,12 @@ DALEK_GUN_SRC = {"se": (95, 76), "ne": (103, 47)}
 DALEK_EYE_SRC = {"se": (79, 30), "ne": (77, 5)}
 DALEK_SPACING = (12, 10, 8, 6, 4, 2)  # wanted gap between Daleks, relaxed in turn
 # The TARDIS that dropped Archie off dematerialises behind him at the start.
-DEMAT_MS = 3600              # whole effect; the box is gone by about 3.3 s
-DEMAT_PULSE_MS = 1000        # one fade pulse (and one wheeze-groan) per second
+DEMAT_WAIT_MS = 5000         # it stands solid for 5 s before it starts to go
+DEMAT_MS = 3600              # effect length with our own sound; the box is gone 300 ms before the end
+DEMAT_MIN_MS = 3000          # with a user-supplied sound, the fade follows its length ...
+DEMAT_MAX_MS = 15000         # ... clamped to 3-15 s
+DEMAT_END_GAP_MS = 300       # the box has fully faded this long before the effect ends
+DEMAT_PULSE_MS = 1000        # one fade pulse (and one wheeze-groan) per second (longer for long clips)
 DEMAT_BACK = 0.32            # cells behind Archie's start spot, so he stands in front
 DEMAT_LEVELS = 24            # pre-faded copies of the TARDIS (no set_alpha on RGBA)
 TARDIS_LAMP_SRC = (59, 11)   # roof lamp in the 119x200 source image
@@ -126,6 +130,10 @@ SOUND_FILES = {
 }
 SOUND_FILES.update({"rustle": "rustle.wav", "cloak_on": "cloak_on.wav", "cloak_off": "cloak_off.wav",
                     "tardis_demat": "tardis_demat.wav"})
+# Optional user-supplied TARDIS sound (not included, git-ignored). The first of
+# these that pygame can load replaces our synthesised tardis_demat.wav.
+TARDIS_REAL_FILES = ("tardis_real.wav", "tardis_real.ogg", "tardis_real.mp3")
+TARDIS_REAL_VOLUME = 0.7
 SOUND_VOLUME = {
     "ow": 0.38, "exterminate": 0.9, "laser": 0.7,
     "step1": 0.45, "step2": 0.45, "step3": 0.45,
@@ -143,8 +151,10 @@ RUSTLE_GAP_MS = 450          # the soft rustle at most about twice a second
 # while the Dalek turns or stands still (aiming, firing, blocked).
 HUM_FILE = "dalek_hum.wav"
 HUM_MAX = 0.28               # channel volume when a Dalek is right next to Archie
-HUM_FAR = 9.0                # silent at this effective distance (cells) ...
+HUM_FAR = 14.0               # silent at this effective distance (cells) ...
 HUM_NEAR = 1.0               # ... full volume at this one or closer
+HUM_CURVE = 2.2              # volume = closeness ** 2.2: far-off Daleks faint, near ones loud
+HUM_STOP_DIST = 16.0         # beyond this (and silent) its channel is stopped
 HUM_PATH_WEIGHT = 0.65       # effective distance = 65% maze path + 35% straight line
 HUM_FADE_OUT_MS = 80         # quick fade when a Dalek stops to turn (pause is 160 ms)
 HUM_FADE_IN_MS = 110         # and back up as it glides off again
@@ -705,6 +715,7 @@ class Sounds:
         self.hum = None
         self.hum_channels = []
         self.hum_levels = [(0.0, 0.0)] * NUM_DALEKS  # last (left, right) asked for
+        self.demat_source = "tardis_demat.wav"       # or the user's tardis_real.* file
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init(MIXER_FREQ, -16, 2, MIXER_BUFFER)
@@ -730,6 +741,20 @@ class Sounds:
                 self.sounds[name] = snd
             except Exception:
                 pass  # missing or unreadable: that one stays silent
+        for filename in TARDIS_REAL_FILES:
+            path = os.path.join(SOUND_DIR, filename)
+            if not os.path.exists(path):
+                continue
+            try:
+                snd = pygame.mixer.Sound(path)
+                if snd.get_length() <= 0.0:
+                    continue
+                snd.set_volume(TARDIS_REAL_VOLUME)
+                self.sounds["tardis_demat"] = snd
+                self.demat_source = filename
+                break
+            except Exception:
+                continue  # unreadable (e.g. no mp3 support): try the next, else ours
 
     def length_ms(self, name: str, default: float) -> float:
         snd = self.sounds.get(name)
@@ -970,7 +995,13 @@ class Game:
         self.cooldown_until = 0.0
         self.disguise_pending = False
         self.exit_cell = (MAZE_SIZE - 2, MAZE_SIZE - 2)
-        self.demat_t0 = None  # set on the first update, which also plays the sound
+        self.start_t0 = None  # game time of the first update
+        self.demat_t0 = None  # when the dematerialisation (and its sound) starts
+        if self.sfx.demat_source != "tardis_demat.wav":
+            real = self.sfx.length_ms("tardis_demat", DEMAT_MS)
+            self.demat_len = max(DEMAT_MIN_MS, min(DEMAT_MAX_MS, real))
+        else:
+            self.demat_len = DEMAT_MS
         self.demat_cell = (1, 1)
         self.demat_back = (-DIR_ORDER[0][0], -DIR_ORDER[0][1])  # behind his start facing
         self.daleks = []
@@ -1233,9 +1264,9 @@ class Game:
         if name == "tardis_demat":
             # The start of a game: Archie on his start cell, the TARDIS behind him.
             self._park_other_daleks(None)
-            self.demat_t0 = now
-            self.sfx.play("tardis_demat")
-            return 1500.0
+            self.start_t0 = now
+            self.demat_t0 = None
+            return DEMAT_WAIT_MS + 1500.0  # --scene-ms counts from the start of the game
         if name == "tardis":
             # Three path cells back from the TARDIS, facing along the way to it.
             dist = self._path_dist(self.exit_cell)
@@ -1448,8 +1479,10 @@ class Game:
     def update(self, now: float):
         dt = 0.0 if self.last_now is None else max(0.0, min(100.0, now - self.last_now))
         self.last_now = now
-        if self.demat_t0 is None:
-            self.demat_t0 = now
+        if self.start_t0 is None:
+            self.start_t0 = now
+        if self.demat_t0 is None and now - self.start_t0 >= DEMAT_WAIT_MS:
+            self.demat_t0 = self.start_t0 + DEMAT_WAIT_MS
             self.sfx.play("tardis_demat")
         if self.disguised and now - self.disguise_t0 >= DISGUISE_MS:
             self._end_disguise(now)
@@ -1495,7 +1528,7 @@ class Game:
             dist = self._hum_distance(d, archie_pos)
             d.hum_dist = dist
             u = max(0.0, min(1.0, (HUM_FAR - dist) / (HUM_FAR - HUM_NEAR)))
-            d.near += (u * u - d.near) * k
+            d.near += (u ** HUM_CURVE - d.near) * k
             if not active:
                 d.glide = 0.0 if self.sfx.muted else max(0.0, d.glide - dt / HUM_FADE_OUT_MS)
             elif d.gliding(now):
@@ -1510,7 +1543,7 @@ class Game:
             pan = max(-1.0, min(1.0, (dx - ax) / (self.view_w / 2))) * HUM_PAN
             left = vol * (1.0 - max(0.0, pan))
             right = vol * (1.0 + min(0.0, pan))
-            keep = active and dist < HUM_FAR + 2.0
+            keep = active and dist < HUM_STOP_DIST
             self.sfx.set_hum(i, left, right, keep)
 
     def _update_archie(self, now: float):
@@ -1626,7 +1659,7 @@ class Game:
             entities.append((d.pos[0] + d.pos[1], 0, lambda d=d: self._draw_dalek(screen, d, now, cam_x, cam_y)))
         ec, er = self.exit_cell
         entities.append((float(ec + er), 2, lambda: self._draw_tardis(screen, cam_x, cam_y)))
-        if self.demat_t0 is None or now - self.demat_t0 < DEMAT_MS:
+        if self.demat_t0 is None or now - self.demat_t0 < self.demat_len:
             dc, dr = self.demat_cell
             # Drawn just before Archie when he is on the start cell (same depth,
             # lower priority), so he always stands in front of it.
@@ -1689,23 +1722,29 @@ class Game:
         screen.blit(img, (int(round(fx - ax)), int(round(fy - ay))))
 
     def demat_alpha(self, now: float):
-        """(TARDIS opacity, lamp brightness), both 0..1, during the dematerialisation.
+        """(TARDIS opacity, lamp brightness), both 0..1.
 
-        Classic fade pulsing: one pulse per second (solid at 0, 1, 2 s, faintest
-        at 0.5, 1.5, 2.5 s, as each wheeze-groan swells) inside an overall fade
-        that reaches nothing at about 3.3 s. The roof lamp flashes throughout.
+        For the first 5 s the TARDIS stands solid with its lamp glowing gently.
+        Then the dematerialisation: classic fade pulsing (solid, faint, solid
+        again, about once a second with our sound) inside an overall fade that
+        reaches nothing DEMAT_END_GAP_MS before the sound ends. A longer
+        user-supplied sound stretches the fade and slows the pulses to match.
+        The roof lamp flashes while it goes.
         """
-        if self.demat_t0 is None:
-            return 1.0, 0.0
+        if self.demat_t0 is None or now < self.demat_t0:
+            since = 0.0 if self.start_t0 is None else now - self.start_t0
+            return 1.0, 0.45 + 0.15 * math.sin(2 * math.pi * since / 2000.0)
         t = now - self.demat_t0
-        if t < 0 or t >= DEMAT_MS:
+        if t >= self.demat_len:
             return 0.0, 0.0
-        u = min(1.0, t / 3300.0)
+        fade_end = self.demat_len - DEMAT_END_GAP_MS
+        period = DEMAT_PULSE_MS * math.sqrt(max(1.0, self.demat_len / DEMAT_MS))
+        u = min(1.0, t / fade_end)
         overall = 1.0 - u * u * (3.0 - 2.0 * u)
-        pulse = 0.12 + 0.88 * (0.5 + 0.5 * math.cos(2 * math.pi * t / DEMAT_PULSE_MS)) ** 1.5
+        pulse = 0.12 + 0.88 * (0.5 + 0.5 * math.cos(2 * math.pi * t / period)) ** 1.5
         alpha = overall * pulse
-        flash = (0.5 + 0.5 * math.cos(2 * math.pi * t / 500.0)) ** 2
-        lamp = flash * min(1.0, 0.25 + 1.2 * overall) * (1.0 if t < 3300 else 0.0)
+        flash = (0.5 + 0.5 * math.cos(2 * math.pi * t / (period / 2))) ** 2
+        lamp = flash * min(1.0, 0.25 + 1.2 * overall) * (1.0 if t < fade_end else 0.0)
         return alpha, lamp
 
     def _draw_demat(self, screen, now: float, cam_x: float, cam_y: float):
