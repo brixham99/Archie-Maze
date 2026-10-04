@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import random
 import sys
 import time
 
@@ -72,6 +73,33 @@ SPRITE_FILES = {
     "e": os.path.join(HERE, "assets", "archie_e.png"),
     "w": os.path.join(HERE, "assets", "archie_w.png"),
 }
+
+DALEK_FILES = {k: os.path.join(HERE, "assets", f"dalek_{k}.png") for k in ("se", "sw", "ne", "nw")}
+TARDIS_FILE = os.path.join(HERE, "assets", "tardis.png")
+
+# --- Daleks, the TARDIS and the hedge disguise (pre-zoom pixels, ms) ---
+DALEK_H = 86                 # Archie is SPRITE_H = 74
+TARDIS_H = 124
+N_DALEKS = 2
+DALEK_STEP_MS = 260          # per cell, gliding; Archie takes MOVE_MS = 150
+DALEK_TURN_MS = 160          # pause when a Dalek changes direction
+DALEK_SIGHT = 8              # cells along the corridor it is facing
+DALEK_TELEGRAPH_MS = 350     # eye-stalk glow before the shot
+DALEK_MIN_START_DIST = 12    # path distance from Archie's start
+DALEK_MIN_EXIT_DIST = 10     # path distance from the exit
+LASER_MS = 450               # how long the beam stays on screen
+DEATH_FADE_MS = 900          # Archie flickers, whites out and fades
+DEATH_MSG_MS = 1000          # then the EXTERMINATED! panel
+DISGUISE_MS = 4000
+DISGUISE_COOLDOWN_MS = 3000
+POOF_MS = 280
+DISGUISE_SCALE = 0.86
+# Gun tip and eye-stalk tip in the 160 px source images. SW/NW are exact
+# mirror images of SE/NE, so their points are mirrored at load time.
+DALEK_GUN_SRC = {"se": (95, 76), "ne": (103, 47)}
+DALEK_EYE_SRC = {"se": (79, 30), "ne": (77, 5)}
+DISGUISE_KEYS = (pygame.K_h, pygame.K_LSHIFT, pygame.K_RSHIFT)
+RESTART_KEYS = (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_r, pygame.K_SPACE)
 
 KEY_ACTIONS = {
     pygame.K_LEFT: ("turn", -1),
@@ -540,6 +568,87 @@ def hedge_variant_grid(grid, seed: int):
     return out
 
 
+def _despill(image: pygame.Surface) -> pygame.Surface:
+    """Remove the magenta matte fringe left round the cut-out sprites."""
+    rgb = pygame.surfarray.pixels3d(image)
+    alpha = pygame.surfarray.pixels_alpha(image)
+    r = rgb[..., 0].astype(np.int16)
+    g = rgb[..., 1].astype(np.int16)
+    b = rgb[..., 2].astype(np.int16)
+    spill = np.minimum(r, b) - g
+    fix = (spill > 0) & (alpha > 0) & ((alpha < 255) | (spill > 30))
+    sp = np.where(fix, spill, 0)
+    rgb[..., 0] = np.clip(r - sp, 0, 255).astype(np.uint8)
+    rgb[..., 2] = np.clip(b - sp, 0, 255).astype(np.uint8)
+    del rgb, alpha
+    return image
+
+
+def _base_anchor(image: pygame.Surface):
+    """Centre of an isometric base: midway between the lowest points of the
+    leftmost and rightmost opaque columns in the bottom third."""
+    a = pygame.surfarray.array_alpha(image) > 64
+    w, h = a.shape
+    y0 = int(h * 0.66)
+    xs, ys = np.nonzero(a[:, y0:])
+    left, right = xs.min(), xs.max()
+    yl = ys[xs == left].max() + y0
+    yr = ys[xs == right].max() + y0
+    return (left + right + 1) / 2.0, (yl + yr + 1) / 2.0
+
+
+def _load_scaled(path: str, height: int):
+    src = pygame.image.load(path).convert_alpha()
+    _despill(src)
+    k = height / src.get_height()
+    w = max(1, round(src.get_width() * k))
+    return src, pygame.transform.smoothscale(src, (w, height)), k
+
+
+def _make_glow(radius: int, colour):
+    """Additive radial glow (blit with BLEND_RGB_ADD)."""
+    size = radius * 2 + 1
+    yy, xx = np.mgrid[0:size, 0:size]
+    d = np.sqrt((xx - radius) ** 2 + (yy - radius) ** 2) / radius
+    fall = np.clip(1.0 - d, 0.0, 1.0) ** 1.6
+    img = (fall[..., None] * np.array(colour, dtype=np.float64)[None, None, :]).clip(0, 255)
+    return pygame.surfarray.make_surface(img.transpose(1, 0, 2).astype(np.uint8)).convert()
+
+
+class Dalek:
+    """Glides cell to cell along corridors; looks only the way it faces."""
+
+    def __init__(self, col: int, row: int, facing, rng: random.Random):
+        self.pos = [float(col), float(row)]
+        self.target = (col, row)
+        self.facing = facing
+        self.prev_facing = facing
+        self.turn_t0 = -1e9
+        self.wait_until = 0.0
+        self.state = "roam"  # roam, aim, fire
+        self.fire_at = 0.0
+        self.aim_t0 = 0.0
+        self.fire_t0 = 0.0
+        self.rng = rng
+        self.feet = (0, 0)  # view-space feet, set while drawing
+
+    def cell(self):
+        return int(round(self.pos[0])), int(round(self.pos[1]))
+
+    def face(self, direction, now: float) -> bool:
+        if direction == self.facing:
+            return False
+        self.prev_facing = self.facing
+        self.facing = direction
+        self.turn_t0 = now
+        return True
+
+    def sprite_key(self, now: float) -> str:
+        if now - self.turn_t0 < DALEK_TURN_MS / 2:
+            return FACING_SPRITE[self.prev_facing]
+        return FACING_SPRITE[self.facing]
+
+
 class Game:
     def __init__(self, seed: int | None):
         self.sprites = {}
@@ -552,6 +661,48 @@ class Game:
                 image = pygame.transform.smoothscale(image, (w, SPRITE_H))
             self.sprites[key] = image
             self.anchors[key] = _feet_anchor(image)
+        # White silhouettes for the death flicker.
+        self.white = {}
+        for key, image in self.sprites.items():
+            ghost = image.copy()
+            ghost.fill((255, 255, 255), special_flags=pygame.BLEND_RGB_MAX)
+            self.white[key] = ghost
+        self.dalek_sprites = {}
+        self.dalek_anchor = {}
+        self.dalek_gun = {}
+        self.dalek_eye = {}
+        for key in ("se", "ne"):
+            mirror = {"se": "sw", "ne": "nw"}[key]
+            src, image, k = _load_scaled(DALEK_FILES[key], DALEK_H)
+            sw = src.get_width()
+            flipped = pygame.transform.flip(image, True, False)
+            for name, img, flip in ((key, image, False), (mirror, flipped, True)):
+                self.dalek_sprites[name] = img
+                self.dalek_anchor[name] = _base_anchor(img)
+                gx, gy = DALEK_GUN_SRC[key]
+                ex, ey = DALEK_EYE_SRC[key]
+                if flip:
+                    gx, ex = sw - 1 - gx, sw - 1 - ex
+                self.dalek_gun[name] = ((gx + 0.5) * k, (gy + 0.5) * k)
+                self.dalek_eye[name] = ((ex + 0.5) * k, (ey + 0.5) * k)
+        _src, self.tardis, _k = _load_scaled(TARDIS_FILE, TARDIS_H)
+        self.tardis_anchor = _base_anchor(self.tardis)
+        self.dalek_shadow = pygame.Surface((50, 18), pygame.SRCALPHA)
+        pygame.draw.ellipse(self.dalek_shadow, (30, 20, 10, 120), self.dalek_shadow.get_rect())
+        self.tardis_shadow = pygame.Surface((76, 30), pygame.SRCALPHA)
+        pygame.draw.ellipse(self.tardis_shadow, (24, 16, 8, 110), self.tardis_shadow.get_rect())
+        self.scorch = pygame.Surface((34, 14), pygame.SRCALPHA)
+        pygame.draw.ellipse(self.scorch, (20, 12, 6, 170), self.scorch.get_rect())
+        pygame.draw.ellipse(self.scorch, (10, 6, 4, 200), self.scorch.get_rect().inflate(-14, -6))
+        self.glow_eye = _make_glow(int(13 * ZOOM), (190, 235, 255))
+        self.glow_hit = _make_glow(int(16 * ZOOM), (140, 200, 255))
+        self.puffs = []
+        for radius in (2, 3, 4, 5, 6):
+            puff = pygame.Surface((radius * 2 + 2, radius * 2 + 2), pygame.SRCALPHA)
+            pygame.draw.circle(puff, (214, 236, 190, 255), (radius + 1, radius + 1), radius)
+            pygame.draw.circle(puff, (246, 252, 236, 255), (radius, radius), max(1, radius - 2))
+            self.puffs.append(puff)
+        self.disguise_cache = {}
         self.shadow = pygame.Surface((40, 16), pygame.SRCALPHA)
         pygame.draw.ellipse(self.shadow, (48, 30, 16, 110), self.shadow.get_rect())
         self.dirt = build_dirt_variants(make_dirt_texture())
@@ -562,6 +713,10 @@ class Game:
         self.font_hint = load_font(18)
         self.font_big = load_font(36, bold=True)
         self.font_small = load_font(20)
+        self.font_shout = load_font(16, bold=True)
+        self.font_hud = load_font(16)
+        self.cam = (0.0, 0.0)
+        self.archie_feet = (0, 0)
         self.given_seed = seed
         self.reset(seed if seed is not None else (time.time_ns() & 0x7FFFFFFF))
 
@@ -586,6 +741,295 @@ class Game:
         self.queued = None
         self.bump_dir = None
         self.bump_t0 = 0
+        self.last_now = None
+        self.dead = False
+        self.death_t0 = 0.0
+        self.dead_pos = (1.0, 1.0)
+        self.shooter = None
+        self.disguised = False
+        self.disguise_t0 = -1e9
+        self.disguise_end_t = -1e9
+        self.cooldown_until = 0.0
+        self.disguise_pending = False
+        self.exit_cell = (MAZE_SIZE - 2, MAZE_SIZE - 2)
+        self.daleks = []
+        self._spawn_daleks()
+
+    # ----- Daleks -------------------------------------------------------
+    def _path_dist(self, start):
+        dist = {start: 0}
+        queue = [start]
+        i = 0
+        while i < len(queue):
+            c, r = queue[i]
+            i += 1
+            for dc, dr in DIR_ORDER:
+                n = (c + dc, r + dr)
+                if n not in dist and self.is_open(*n):
+                    dist[n] = dist[(c, r)] + 1
+                    queue.append(n)
+        return dist
+
+    def _spawn_daleks(self):
+        rng = random.Random((self.seed * 2654435761 + 12345) & 0xFFFFFFFF)
+        from_start = self._path_dist((1, 1))
+        from_exit = self._path_dist(self.exit_cell)
+        cands = sorted(
+            cell for cell, d in from_start.items()
+            if d >= DALEK_MIN_START_DIST
+            and from_exit.get(cell, 0) >= DALEK_MIN_EXIT_DIST
+            and self.grid[cell[1]][cell[0]] == PATH
+        )
+        chosen = []
+        for _ in range(N_DALEKS):
+            pool = [c for c in cands if all(abs(c[0] - o[0]) + abs(c[1] - o[1]) >= 10 for o in chosen)]
+            pool = pool or [c for c in cands if c not in chosen]
+            if not pool:
+                break
+            chosen.append(rng.choice(pool))
+        self.daleks = []
+        for i, (c, r) in enumerate(chosen):
+            dirs = [d for d in DIR_ORDER if self.is_open(c + d[0], r + d[1])]
+            facing = rng.choice(dirs) if dirs else DIR_SE
+            self.daleks.append(Dalek(c, r, facing, random.Random(self.seed * 31 + i * 1009 + 7)))
+
+    def _archie_cells(self):
+        cells = {(self.col, self.row)}
+        if self.moving:
+            cells.add(self.dst)
+        return cells
+
+    def _dalek_cells(self, exclude=None):
+        cells = set()
+        for d in self.daleks:
+            if d is exclude:
+                continue
+            cells.add(d.cell())
+            cells.add(d.target)
+        return cells
+
+    def archie_exposed(self) -> bool:
+        return not (self.disguised or self.dead or self.won)
+
+    def _sees(self, d: Dalek) -> bool:
+        if not self.archie_exposed():
+            return False
+        c, r = d.cell()
+        dc, dr = d.facing
+        archie = self._archie_cells()
+        for k in range(1, DALEK_SIGHT + 1):
+            cell = (c + dc * k, r + dr * k)
+            if not self.is_open(*cell):
+                return False
+            if cell in archie:
+                return True
+        return False
+
+    def _choose_next(self, d: Dalek, now: float) -> bool:
+        """At a cell centre: pick the next cell. True if it can keep gliding."""
+        c, r = d.cell()
+        f = d.facing
+        back = (-f[0], -f[1])
+        others = self._dalek_cells(exclude=d)
+        archie = self._archie_cells()
+        exposed = self.archie_exposed()
+        opts = []
+        for dirn in DIR_ORDER:
+            n = (c + dirn[0], r + dirn[1])
+            if not self.is_open(*n) or n == self.exit_cell or n in others:
+                continue
+            if n in archie and not exposed:
+                continue  # a hedge (or a corpse) is in the way: turn away
+            opts.append(dirn)
+        pool = [o for o in opts if o != back] or [o for o in opts if o == back]
+        if not pool:
+            d.wait_until = now + 250
+            return False
+        dirn = d.rng.choice(pool)
+        n = (c + dirn[0], r + dirn[1])
+        turned = d.face(dirn, now)
+        if n in archie:
+            # Bumped into Archie in the open: that counts as seeing him.
+            d.state = "aim"
+            d.aim_t0 = now
+            d.fire_at = now + DALEK_TELEGRAPH_MS + (DALEK_TURN_MS if turned else 0)
+            return False
+        d.target = n
+        if turned:
+            d.wait_until = now + DALEK_TURN_MS
+            return False
+        return True
+
+    def _update_daleks(self, now: float, dt: float):
+        for d in self.daleks:
+            if d.state == "fire":
+                continue
+            if d.state == "aim":
+                if not self._sees(d):
+                    d.state = "roam"  # lost him (hedge, or he slipped away)
+                elif now >= d.fire_at:
+                    d.state = "fire"
+                    d.fire_t0 = now
+                    self._kill(now, d)
+                continue
+            if self._sees(d):
+                d.state = "aim"
+                d.aim_t0 = now
+                d.fire_at = now + DALEK_TELEGRAPH_MS
+                continue
+            if now < d.wait_until:
+                continue
+            move = dt / DALEK_STEP_MS
+            for _ in range(4):
+                tc, tr = d.target
+                dx = tc - d.pos[0]
+                dy = tr - d.pos[1]
+                dist = abs(dx) + abs(dy)
+                if dist <= move:
+                    d.pos = [float(tc), float(tr)]
+                    move -= dist
+                    if not self._choose_next(d, now) or move <= 0:
+                        break
+                else:
+                    if dx:
+                        d.pos[0] += math.copysign(move, dx)
+                    else:
+                        d.pos[1] += math.copysign(move, dy)
+                    break
+
+    def _kill(self, now: float, shooter: Dalek):
+        if self.dead or self.won:
+            return
+        self.dead_pos = self.visual_pos(now)
+        self.dead = True
+        self.death_t0 = now
+        self.shooter = shooter
+        self.moving = False
+        self.turning = False
+        self.queued = None
+        self.bump_dir = None
+        self.disguise_pending = False
+
+    # ----- Hedge disguise ----------------------------------------------
+    def toggle_disguise(self, now: float):
+        if self.dead or self.won:
+            return
+        if self.disguised:
+            self._end_disguise(now)
+            return
+        if now < self.cooldown_until:
+            return
+        if self.busy():
+            self.disguise_pending = True  # as soon as this hop lands
+            self.queued = None
+            return
+        self._start_disguise(now)
+
+    def _start_disguise(self, now: float):
+        self.disguised = True
+        self.disguise_t0 = now
+        self.disguise_pending = False
+        self.queued = None
+        self.wish = None
+        self.bump_dir = None
+
+    def _end_disguise(self, now: float):
+        self.disguised = False
+        self.disguise_end_t = now
+        self.cooldown_until = now + DISGUISE_COOLDOWN_MS
+
+    # ----- Debug scenes for headless screenshots -------------------------
+    def _straight_run(self, direction, length: int):
+        """First run of length+1 open cells along direction whose inner cells
+        are plain corridor (no side openings). Scans from the maze centre."""
+        dc, dr = direction
+        side = [d for d in DIR_ORDER if d not in (direction, (-dc, -dr))]
+        mid = MAZE_SIZE // 2
+        cells = sorted(
+            ((c, r) for r in range(1, MAZE_SIZE - 1) for c in range(1, MAZE_SIZE - 1)),
+            key=lambda p: abs(p[0] - mid) + abs(p[1] - mid),
+        )
+        for c, r in cells:
+            run = [(c + dc * k, r + dr * k) for k in range(length + 1)]
+            if not all(self.is_open(*p) and self.grid[p[1]][p[0]] == PATH for p in run):
+                continue
+            if any(self.is_open(p[0] + s[0], p[1] + s[1]) for p in run[1:-1] for s in side):
+                continue
+            return run
+        return None
+
+    def _place_archie(self, cell, facing):
+        self.col, self.row = cell
+        self.src = self.dst = cell
+        self.facing_index = DIR_ORDER.index(facing)
+        self.facing = self.turn_from = facing
+        self.moving = self.turning = False
+
+    def _park_other_daleks(self, keep):
+        """Move the other Daleks well away so they do not join the scene."""
+        far = sorted(
+            (abs(c - self.col) + abs(r - self.row), c, r)
+            for r in range(MAZE_SIZE) for c in range(MAZE_SIZE)
+            if self.grid[r][c] == PATH
+        )
+        for i, d in enumerate(self.daleks):
+            if d is keep:
+                continue
+            _, c, r = far[-1 - i * 3]
+            d.pos = [float(c), float(r)]
+            d.target = (c, r)
+
+    def setup_scene(self, name: str, now: float = 0.0) -> float:
+        """Arrange a scene and return how long (ms) to simulate before the shot."""
+        self.last_now = now
+        if name == "tardis":
+            # Three path cells back from the TARDIS, facing along the way to it.
+            dist = self._path_dist(self.exit_cell)
+            cell = min((c for c, k in dist.items() if k == 3), default=self.exit_cell)
+            facing = next(
+                (d for d in DIR_ORDER if dist.get((cell[0] + d[0], cell[1] + d[1])) == 2),
+                DIR_SE,
+            )
+            self._place_archie(cell, facing)
+            self._park_other_daleks(None)
+            return 0.0
+        run = self._straight_run(DIR_SE, 4) or self._straight_run(DIR_SW, 4)
+        if run is None:
+            raise SystemExit("no straight corridor for the scene")
+        fwd = (run[1][0] - run[0][0], run[1][1] - run[0][1])
+        back = (-fwd[0], -fwd[1])
+        d = self.daleks[0]
+        if name == "dalek":
+            # Archie behind, the Dalek gliding away from him towards the viewer.
+            self._place_archie(run[0], fwd)
+            d.pos = [float(run[2][0]), float(run[2][1])]
+            d.target = run[3]
+            d.facing = d.prev_facing = fwd
+            self._park_other_daleks(d)
+            return 120.0
+        if name == "laser":
+            self._place_archie(run[4], back)
+            d.pos = [float(run[0][0]), float(run[0][1])]
+            d.target = run[0]
+            d.facing = d.prev_facing = fwd
+            self._park_other_daleks(d)
+            return DALEK_TELEGRAPH_MS + 260.0
+        if name == "telegraph":
+            self._place_archie(run[4], back)
+            d.pos = [float(run[0][0]), float(run[0][1])]
+            d.target = run[0]
+            d.facing = d.prev_facing = fwd
+            self._park_other_daleks(d)
+            return DALEK_TELEGRAPH_MS * 0.8
+        if name == "disguise":
+            self._place_archie(run[3], back)
+            self._start_disguise(now)
+            d.pos = [float(run[0][0]), float(run[0][1])]
+            d.target = run[1]
+            d.facing = d.prev_facing = fwd
+            self._park_other_daleks(d)
+            return 620.0
+        raise SystemExit(f"unknown scene {name!r}")
 
     def is_open(self, col: int, row: int) -> bool:
         if not (0 <= col < MAZE_SIZE and 0 <= row < MAZE_SIZE):
@@ -628,7 +1072,7 @@ class Game:
         if sign < 0:
             dc, dr = -dc, -dr
         nc, nr = self.col + dc, self.row + dr
-        if not self.is_open(nc, nr):
+        if not self.is_open(nc, nr) or (nc, nr) in self._dalek_cells():
             if self.bump_dir != (dc, dr):
                 self.bump_dir = (dc, dr)
                 self.bump_t0 = now
@@ -642,7 +1086,7 @@ class Game:
         return True
 
     def try_action(self, action, now: float) -> bool:
-        if self.won:
+        if self.won or self.dead or self.disguised or self.disguise_pending:
             return False
         if self.busy():
             # One queued tap, same idea as the old queued step.
@@ -689,17 +1133,20 @@ class Game:
         return None
 
     def on_key(self, key: int, now: float):
-        if key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_r, pygame.K_SPACE) and self.won:
+        if key in RESTART_KEYS and (self.won or (self.dead and now - self.death_t0 >= LASER_MS)):
             self.reset(time.time_ns() & 0x7FFFFFFF)
             return
+        if key in DISGUISE_KEYS:
+            self.toggle_disguise(now)
+            return
         action = KEY_ACTIONS.get(key)
-        if action is None or self.won:
+        if action is None or self.won or self.dead:
             return
         self.wish = action
         self.try_action(action, now)
 
     def hold_action(self, keys, now: float):
-        if self.busy() or self.won:
+        if self.busy() or self.won or self.dead or self.disguised:
             return
         action = self.desired_action(keys)
         if action is None:
@@ -709,7 +1156,7 @@ class Game:
 
     def nudge(self, now: float):
         """Headless test: step forward, or turn right if that cell is shut."""
-        if self.busy() or self.won:
+        if self.busy() or self.won or self.dead or self.disguised:
             return
         dc, dr = self.facing
         if self.is_open(self.col + dc, self.row + dr):
@@ -724,6 +1171,19 @@ class Game:
             self.try_action(queued, now)
 
     def update(self, now: float):
+        dt = 0.0 if self.last_now is None else max(0.0, min(100.0, now - self.last_now))
+        self.last_now = now
+        if self.disguised and now - self.disguise_t0 >= DISGUISE_MS:
+            self._end_disguise(now)
+        if not self.dead:
+            self._update_archie(now)
+        if self.disguise_pending and not self.busy() and not self.dead and not self.won:
+            self.disguise_pending = False
+            if now >= self.cooldown_until:
+                self._start_disguise(now)
+        self._update_daleks(now, dt)
+
+    def _update_archie(self, now: float):
         if self.turning:
             if now - self.turn_t0 >= TURN_MS:
                 self.turning = False
@@ -749,6 +1209,8 @@ class Game:
         return 0.5 + ease((t - 0.5) / 0.5) * 0.5
 
     def visual_pos(self, now: float):
+        if self.dead:
+            return self.dead_pos
         if self.moving:
             u = self._step_u(now)
             sc, sr = self.src
@@ -790,11 +1252,15 @@ class Game:
             pygame.transform.smoothscale(view, screen.get_size(), screen)
         else:
             pygame.transform.scale(view, screen.get_size(), screen)
-        # HUD at full window resolution, on top of the scaled world.
+        # Effects and HUD at full window resolution, on top of the scaled world.
+        self._draw_effects(screen, now)
         self._draw_minimap(screen)
         self._draw_hint(screen)
+        self._draw_disguise_hud(screen, now)
         if self.won:
-            self._draw_win(screen)
+            self._draw_panel(screen, "You reached the TARDIS!", "Press Enter to play again", (255, 244, 214))
+        elif self.dead and now - self.death_t0 >= DEATH_MSG_MS:
+            self._draw_panel(screen, "EXTERMINATED!", "Press Enter to try again", (255, 96, 72))
 
     def _draw_world(self, screen: pygame.Surface, now: float):
         screen.fill(BG_COLOUR)
@@ -805,6 +1271,7 @@ class Game:
         # just above centre. The maze scrolls; tiles are not yaw-rotated.
         cam_x = feet_x - self.view_w / 2
         cam_y = (feet_y - 46) - self.view_h / 2
+        self.cam = (cam_x, cam_y)
         tiles = self._visible_tiles(cam_x, cam_y)
 
         feet_sx = int(round(feet_x - cam_x))
@@ -813,22 +1280,29 @@ class Game:
             t = max(0.0, min(1.0, (now - self.move_t0) / MOVE_MS))
             local = (t * 2.0) % 1.0 if t < 1.0 else 0.0
             feet_sy -= int(round(math.sin(local * math.pi) * 2))
-        # One pass, back to front. Archie slots in when tiles in front start.
+        self.archie_feet = (feet_sx, feet_sy)
+        # One pass, back to front. Archie, the Daleks and the TARDIS slot in
+        # by depth (row + col) when the tiles in front of them start.
         char_depth = vrow + vcol
-        drew = False
+        entities = [(char_depth, 1, lambda: self._draw_archie(screen, feet_sx, feet_sy, now))]
+        for d in self.daleks:
+            entities.append((d.pos[0] + d.pos[1], 0, lambda d=d: self._draw_dalek(screen, d, now, cam_x, cam_y)))
+        ec, er = self.exit_cell
+        entities.append((float(ec + er), 2, lambda: self._draw_tardis(screen, cam_x, cam_y)))
+        entities.sort(key=lambda e: (e[0], e[1]))
+        k = 0
         for depth, col, row, tx, ty in tiles:
-            if not drew and depth > char_depth + 0.05:
-                self._draw_archie(screen, feet_sx, feet_sy, now)
-                drew = True
+            while k < len(entities) and depth > entities[k][0] + 0.05:
+                entities[k][2]()
+                k += 1
             cell = self.grid[row][col]
             if cell == WALL:
                 self._draw_hedge(screen, col, row, tx, ty)
-            elif cell == EXIT:
-                self._draw_exit(screen, tx, ty)
             else:
                 self._draw_dirt(screen, col, row, tx, ty)
-        if not drew:
-            self._draw_archie(screen, feet_sx, feet_sy, now)
+        while k < len(entities):
+            entities[k][2]()
+            k += 1
 
     def _fog(self, colour, sy: int):
         # Slight aerial perspective: tiles higher on the screen are a touch darker.
@@ -858,51 +1332,222 @@ class Game:
         sprite = self.hedges[self.hedge_variant[row][col]][shade]
         screen.blit(sprite, (tx - HEDGE_OX, ty - HEDGE_OY))
 
-    def _draw_exit(self, screen, tx: int, ty: int):
-        stone = self._fog((214, 198, 150), ty)
-        stone_edge = self._fog((148, 112, 64), ty)
-        pts = diamond_points(tx, ty)
-        pygame.draw.polygon(screen, stone, pts)
-        inner = (
-            (tx, ty + 5),
-            (tx + TILE_W // 2 - 8, ty + TILE_H // 2),
-            (tx, ty + TILE_H - 5),
-            (tx - TILE_W // 2 + 8, ty + TILE_H // 2),
-        )
-        pygame.draw.polygon(screen, self._fog((232, 214, 168), ty), inner)
-        pygame.draw.polygon(screen, stone_edge, pts, 1)
-        hw = TILE_W // 2
-        hh = TILE_H // 2
-        left = (tx - hw // 2 + 2, ty + hh + 6)
-        right = (tx + hw // 2 - 2, ty + hh + 6)
-        post_h = 52
-        post = (122, 74, 38)
-        light = (214, 168, 86)
-        for x, y in (left, right):
-            pygame.draw.line(screen, post, (x, y), (x, y - post_h), 5)
-            pygame.draw.line(screen, light, (x - 1, y - 4), (x - 1, y - post_h + 2), 1)
-        arch_top = ((left[0] + right[0]) // 2, left[1] - post_h - 16)
-        pygame.draw.lines(
-            screen,
-            light,
-            False,
-            [(left[0], left[1] - post_h), arch_top, (right[0], right[1] - post_h)],
-            3,
-        )
-        pygame.draw.line(
-            screen,
-            post,
-            (left[0], left[1] - post_h + 2),
-            (right[0], right[1] - post_h + 2),
-            2,
-        )
+    def _draw_tardis(self, screen, cam_x: float, cam_y: float):
+        """The TARDIS stands on the exit cell, anchored by the centre of its base."""
+        ec, er = self.exit_cell
+        fx, fy = tile_origin(ec, er)
+        fx -= cam_x
+        fy += TILE_H // 2 - cam_y
+        img = self.tardis
+        if fx < -img.get_width() or fx > self.view_w + img.get_width() or fy < -40 or fy > self.view_h + img.get_height():
+            return
+        ax, ay = self.tardis_anchor
+        sh = self.tardis_shadow
+        screen.blit(sh, (int(fx - sh.get_width() / 2), int(fy - sh.get_height() / 2 + 2)))
+        screen.blit(img, (int(round(fx - ax)), int(round(fy - ay))))
+
+    def _draw_dalek(self, screen, d: Dalek, now: float, cam_x: float, cam_y: float):
+        fx, fy = tile_origin(d.pos[0], d.pos[1])
+        fx = int(round(fx - cam_x))
+        fy = int(round(fy + TILE_H // 2 - cam_y))
+        d.feet = (fx, fy)
+        if fx < -80 or fx > self.view_w + 80 or fy < -20 or fy > self.view_h + DALEK_H + 20:
+            return
+        key = d.sprite_key(now)
+        img = self.dalek_sprites[key]
+        ax, ay = self.dalek_anchor[key]
+        sh = self.dalek_shadow
+        screen.blit(sh, (fx - sh.get_width() // 2, fy - sh.get_height() // 2 + 1))
+        screen.blit(img, (int(round(fx - ax)), int(round(fy - ay))))
+
+    def _dalek_point(self, d: Dalek, now: float, table):
+        """A point on a Dalek sprite (gun or eye) in view coordinates."""
+        key = d.sprite_key(now)
+        ax, ay = self.dalek_anchor[key]
+        px, py = table[key]
+        return d.feet[0] - ax + px, d.feet[1] - ay + py
+
+    def _disguise_sprite(self, scale: float, shade: int):
+        variant = ((self.col * 7 + self.row * 13 + self.seed) * 2654435761 >> 7) % N_HEDGE
+        base = self.hedges[variant][shade]
+        key = (variant, shade, round(scale, 2))
+        cached = self.disguise_cache.get(key)
+        if cached is None:
+            w = max(1, int(round(base.get_width() * scale)))
+            h = max(1, int(round(base.get_height() * scale)))
+            cached = pygame.transform.smoothscale(base, (w, h))
+            if len(self.disguise_cache) > 64:
+                self.disguise_cache.clear()
+            self.disguise_cache[key] = cached
+        return cached
+
+    def _draw_poof(self, screen, fx: int, fy: int, t: float):
+        """A little cloud of leaf-dust; t runs 0..1."""
+        if not 0.0 <= t <= 1.0:
+            return
+        alpha = int(235 * (1.0 - t) ** 1.3)
+        reach = 6 + 22 * ease(t)
+        for i in range(12):
+            ang = i * (math.tau / 12) + (i % 3) * 0.35
+            r = reach * (0.75 + 0.25 * ((i * 7) % 5) / 4)
+            px = fx + math.cos(ang) * r
+            py = fy - 18 + math.sin(ang) * r * 0.6
+            puff = self.puffs[max(0, min(4, 4 - int(t * 4) + (i % 2) - 1))]
+            puff.set_alpha(alpha)
+            screen.blit(puff, (int(px - puff.get_width() / 2), int(py - puff.get_height() / 2)))
 
     def _draw_archie(self, screen, feet_sx: int, feet_sy: int, now: float):
         key = self.pose(now)
         sprite = self.sprites[key]
         ax, ay = self.anchors[key]
+        pos = (int(round(feet_sx - ax)), int(round(feet_sy - ay)))
+        if self.dead:
+            t = now - self.death_t0
+            screen.blit(self.scorch, (feet_sx - self.scorch.get_width() // 2, feet_sy - 7))
+            if t < LASER_MS:
+                screen.blit(self.white[key] if int(t / 45) % 2 == 0 else sprite, pos)
+            elif t < DEATH_FADE_MS:
+                ghost = self.white[key]
+                ghost.set_alpha(int(255 * (1.0 - (t - LASER_MS) / (DEATH_FADE_MS - LASER_MS))))
+                screen.blit(ghost, pos)
+                ghost.set_alpha(255)
+            return
+        shade = int(round(max(0.0, min(1.0, (feet_sy - TILE_H // 2) / self.view_h)) * (N_HEDGE_SHADES - 1)))
+        since_on = now - self.disguise_t0
+        since_off = now - self.disguise_end_t
+        if self.disguised:
+            if since_on < POOF_MS:
+                u = since_on / POOF_MS
+                # ease-out with a little overshoot
+                pop = 1.0 + 0.12 * math.sin(math.tau * (u - 0.5)) if u > 0.5 else 0.35 + 0.65 * ease(u * 2)
+                scale = DISGUISE_SCALE * pop
+            else:
+                scale = DISGUISE_SCALE
+            self._blit_disguise(screen, feet_sx, feet_sy, scale, shade)
+            if since_on > POOF_MS * 0.7:
+                self._draw_peek_eyes(screen, feet_sx, feet_sy, now)
+            self._draw_poof(screen, feet_sx, feet_sy, since_on / POOF_MS)
+            return
         screen.blit(self.shadow, (feet_sx - self.shadow.get_width() // 2, feet_sy - 6))
-        screen.blit(sprite, (int(round(feet_sx - ax)), int(round(feet_sy - ay))))
+        screen.blit(sprite, pos)
+        if since_off < POOF_MS:
+            u = since_off / POOF_MS
+            self._blit_disguise(screen, feet_sx, feet_sy, DISGUISE_SCALE * (1.0 - ease(u)), shade)
+            self._draw_poof(screen, feet_sx, feet_sy, u)
+
+    def _draw_peek_eyes(self, screen, fx: int, fy: int, now: float):
+        """Two little eyes peeping over the hedge so the player can find him."""
+        y = fy - 32
+        if (now - self.disguise_t0) % 2600 > 2470:  # blink
+            for ex in (fx - 7, fx + 2):
+                pygame.draw.line(screen, (18, 36, 16), (ex, y + 2), (ex + 4, y + 2))
+            return
+        look = 2 if self.facing in (DIR_SE, DIR_NE) else 0
+        for ex in (fx - 7, fx + 2):
+            pygame.draw.rect(screen, (18, 36, 16), (ex - 1, y - 1, 7, 6))
+            pygame.draw.rect(screen, (248, 248, 238), (ex, y, 5, 4))
+            pygame.draw.rect(screen, (24, 20, 16), (ex + 1 + look // 2, y + 1, 2, 2))
+
+    def _blit_disguise(self, screen, fx: int, fy: int, scale: float, shade: int):
+        if scale < 0.05:
+            return
+        img = self._disguise_sprite(scale, shade)
+        k = img.get_width() / HEDGE_SW
+        # Ground-diamond centre of the hedge sprite sits on Archie's feet.
+        screen.blit(img, (int(round(fx - HEDGE_OX * k)), int(round(fy - (HEDGE_OY + TILE_H // 2) * k))))
+
+    def _to_window(self, x: float, y: float):
+        return x * WIN_W / self.view_w, y * WIN_H / self.view_h
+
+    def _draw_effects(self, screen, now: float):
+        """Telegraph glow, shout, laser and flash, drawn at window resolution."""
+        for d in self.daleks:
+            if d.state == "aim":
+                u = max(0.0, min(1.0, (now - d.aim_t0) / max(1.0, d.fire_at - d.aim_t0)))
+                ex, ey = self._to_window(*self._dalek_point(d, now, self.dalek_eye))
+                flick = 0.75 + 0.25 * math.sin(now * 0.06)
+                g = self.glow_eye
+                size = max(4, int(g.get_width() * (0.45 + 0.75 * u) * flick))
+                glow = pygame.transform.scale(g, (size, size))
+                screen.blit(glow, (int(ex - size / 2), int(ey - size / 2)), special_flags=pygame.BLEND_RGB_ADD)
+                screen.blit(glow, (int(ex - size / 2), int(ey - size / 2)), special_flags=pygame.BLEND_RGB_ADD)
+            if d.state == "aim" or (d.state == "fire" and now - d.fire_t0 < LASER_MS + 400):
+                self._draw_shout(screen, d, now)
+        if self.dead and self.shooter is not None:
+            t = now - self.death_t0
+            if t < LASER_MS:
+                gx, gy = self._to_window(*self._dalek_point(self.shooter, now, self.dalek_gun))
+                fx, fy = self.archie_feet
+                tx, ty = self._to_window(fx, fy - 34)
+                self._draw_laser(screen, (gx, gy), (tx, ty), now, t)
+            if t < 240:
+                a = int(170 * (1.0 - t / 240))
+                screen.fill((a, a, a), special_flags=pygame.BLEND_RGB_ADD)
+
+    def _draw_shout(self, screen, d: Dalek, now: float):
+        fx, fy = d.feet
+        x, y = self._to_window(fx, fy - DALEK_H - 6)
+        jig = int(math.sin(now * 0.05) * 1.5)
+        text = "EXTERMINATE!"
+        fg = self.font_shout.render(text, True, (255, 236, 120))
+        bg = self.font_shout.render(text, True, (60, 10, 6))
+        bx = int(x - fg.get_width() / 2) + jig
+        by = int(y - fg.get_height())
+        for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1), (1, 1)):
+            screen.blit(bg, (bx + ox, by + oy))
+        screen.blit(fg, (bx, by))
+
+    def _draw_laser(self, screen, start, end, now: float, t: float):
+        rng = random.Random(int(now // 33))
+        x0, y0 = start
+        x1, y1 = end
+        pad = 24
+        left = int(min(x0, x1)) - pad
+        top = int(min(y0, y1)) - pad
+        w = int(abs(x1 - x0)) + pad * 2
+        h = int(abs(y1 - y0)) + pad * 2
+        layer = pygame.Surface((w, h))
+        layer.fill((0, 0, 0))
+        a = (x0 - left, y0 - top)
+        b = (x1 - left, y1 - top)
+        fade = 1.0 if t < LASER_MS * 0.6 else max(0.0, 1.0 - (t - LASER_MS * 0.6) / (LASER_MS * 0.4))
+        j = rng.uniform(0.7, 1.25) * fade
+        for width, colour in ((18, (20, 45, 110)), (10, (50, 110, 220)), (5, (150, 205, 255)), (2, (255, 255, 255))):
+            wid = max(1, int(width * j))
+            col = tuple(int(c * fade) for c in colour)
+            pygame.draw.line(layer, col, a, b, wid)
+        screen.blit(layer, (left, top), special_flags=pygame.BLEND_RGB_ADD)
+        for (px, py), glow in (((x0, y0), self.glow_eye), ((x1, y1), self.glow_hit)):
+            size = max(4, int(glow.get_width() * rng.uniform(0.8, 1.15) * fade))
+            g = pygame.transform.scale(glow, (size, size))
+            screen.blit(g, (int(px - size / 2), int(py - size / 2)), special_flags=pygame.BLEND_RGB_ADD)
+
+    def _draw_disguise_hud(self, screen, now: float):
+        if self.disguised:
+            left = max(0.0, DISGUISE_MS - (now - self.disguise_t0))
+            label = f"Hiding as a hedge  {left / 1000:.1f} s   (H to stop)"
+            frac = left / DISGUISE_MS
+            bar = (96, 196, 84)
+        elif now < self.cooldown_until:
+            left = self.cooldown_until - now
+            label = f"Hedge disguise recharging  {left / 1000:.1f} s"
+            frac = 1.0 - left / DISGUISE_COOLDOWN_MS
+            bar = (150, 128, 84)
+        else:
+            label = "Hedge disguise ready  (H)"
+            frac = 1.0
+            bar = (96, 196, 84)
+        text = self.font_hud.render(label, True, (240, 234, 214))
+        pad_x, pad_y = 12, 8
+        bw = max(text.get_width(), 220)
+        box = pygame.Surface((bw + pad_x * 2, text.get_height() + pad_y * 2 + 10), pygame.SRCALPHA)
+        box.fill((36, 24, 16, 190))
+        pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
+        box.blit(text, (pad_x, pad_y))
+        by = pad_y + text.get_height() + 4
+        pygame.draw.rect(box, (20, 14, 10, 230), (pad_x, by, bw, 6))
+        pygame.draw.rect(box, bar, (pad_x, by, int(bw * max(0.0, min(1.0, frac))), 6))
+        screen.blit(box, (WIN_W - box.get_width() - 14, WIN_H - box.get_height() - 14))
 
     def _draw_minimap(self, screen):
         scale = 3
@@ -917,10 +1562,15 @@ class Game:
                 if cell == WALL:
                     colour = (28, 72, 36)
                 elif cell == EXIT:
-                    colour = (232, 196, 96)
+                    colour = (142, 98, 56)
                 else:
                     colour = (142, 98, 56)
                 box.fill(colour, (pad + col * scale, pad + row * scale, scale, scale))
+        ec, er = self.exit_cell
+        pygame.draw.circle(box, (70, 130, 255), (pad + ec * scale + 1, pad + er * scale + 1), 3)
+        for d in self.daleks:
+            c, r = d.cell()
+            pygame.draw.circle(box, (235, 40, 36), (pad + c * scale + 1, pad + r * scale + 1), 2)
         px = pad + int(self.col * scale)
         py = pad + int(self.row * scale)
         pygame.draw.rect(box, (255, 248, 230), (px, py, scale, scale))
@@ -928,7 +1578,7 @@ class Game:
         screen.blit(box, (x, 14))
 
     def _draw_hint(self, screen):
-        text = self.font_hint.render("Left and right to turn. Up to step forward", True, (240, 234, 214))
+        text = self.font_hint.render("Left and right to turn. Up to step forward. H to hide as a hedge", True, (240, 234, 214))
         pad_x, pad_y = 12, 8
         box = pygame.Surface((text.get_width() + pad_x * 2, text.get_height() + pad_y * 2), pygame.SRCALPHA)
         box.fill((36, 24, 16, 180))
@@ -937,9 +1587,9 @@ class Game:
         screen.blit(box, (x, y))
         screen.blit(text, (x + pad_x, y + pad_y))
 
-    def _draw_win(self, screen):
-        title = self.font_big.render("You found the way out", True, (255, 244, 214))
-        sub = self.font_small.render("Press Enter to play again", True, (232, 214, 170))
+    def _draw_panel(self, screen, title_text: str, sub_text: str, title_colour):
+        title = self.font_big.render(title_text, True, title_colour)
+        sub = self.font_small.render(sub_text, True, (232, 214, 170))
         gap = 10
         width = max(title.get_width(), sub.get_width()) + 56
         height = title.get_height() + sub.get_height() + gap + 36
@@ -956,6 +1606,9 @@ def parse_args(argv):
     parser.add_argument("--seed", type=int, default=None, help="maze seed (default: time)")
     parser.add_argument("--screenshot", type=str, default=None, help="save a frame to this path and quit")
     parser.add_argument("--frames", type=int, default=None, help="after the first frame, simulate N movement frames")
+    parser.add_argument("--scene", choices=("dalek", "laser", "telegraph", "disguise", "tardis"), default=None,
+                        help="debug: arrange a scene, simulate it briefly, then screenshot")
+    parser.add_argument("--scene-ms", type=float, default=None, help="debug: override the scene's simulated time")
     return parser.parse_args(argv)
 
 
@@ -965,7 +1618,7 @@ def main(argv=None):
     pygame.display.set_caption("Archie's Hedge Maze")
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     game = Game(args.seed)
-    headless = args.screenshot is not None or args.frames is not None
+    headless = args.screenshot is not None or args.frames is not None or args.scene is not None
 
     if not headless:
         clock = pygame.time.Clock()
@@ -991,8 +1644,21 @@ def main(argv=None):
         return 0
 
     now = 0.0
+    if args.scene:
+        sim = game.setup_scene(args.scene, now)
+        if args.scene_ms is not None:
+            sim = args.scene_ms
+        end = now + sim
+        while now < end:
+            now = min(end, now + 1000.0 / 60.0)
+            game.update(now)
     game.draw(screen, now)
     pygame.display.flip()
+    if args.scene and not args.frames:
+        if args.screenshot:
+            pygame.image.save(screen, args.screenshot)
+        pygame.quit()
+        return 0
     if args.screenshot:
         folder = os.path.dirname(os.path.abspath(args.screenshot))
         if folder:
