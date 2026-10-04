@@ -75,6 +75,16 @@ Drop your own TARDIS sound as `assets/sounds/tardis_real.wav` (or `.ogg`/`.mp3`)
 
 If the computer has no working audio, or a sound file is missing, the game still runs, just silently.
 
+## Effects
+
+The Dalek laser and the eye, gun-tip and hit glows are drawn with plain solid-colour lines and circles. The TARDIS roof-lamp glow is a small PNG in `assets/fx/`, made by:
+
+```bash
+python3 tools/make_fx.py
+```
+
+Each frame is drawn into an opaque back buffer and copied to the window in one go, so the effects look the same on every system.
+
 ## Testing without a screen
 
 ```bash

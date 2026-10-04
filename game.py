@@ -78,6 +78,7 @@ SPRITE_FILES = {
 
 DALEK_FILES = {k: os.path.join(HERE, "assets", f"dalek_{k}.png") for k in ("se", "sw", "ne", "nw")}
 TARDIS_FILE = os.path.join(HERE, "assets", "tardis.png")
+LAMP_GLOW_FILE = os.path.join(HERE, "assets", "fx", "lamp_glow.png")  # tools/make_fx.py
 
 # --- Daleks, the TARDIS and the hedge disguise (pre-zoom pixels, ms) ---
 DALEK_H = 86                 # Archie is SPRITE_H = 74
@@ -92,14 +93,18 @@ DALEK_TELEGRAPH_MS = 350     # eye-stalk glow before the shot
 DALEK_MIN_START_DIST = 12    # path distance from Archie's start
 DALEK_MIN_EXIT_DIST = 10     # path distance from the exit
 LASER_MS = 450               # how long the beam stays on screen
+LASER_WIDTHS = (7, 5, 3, 1)  # px at window resolution: solid lines, widest first
+LASER_COLOURS = ((30, 70, 190), (70, 140, 250), (160, 210, 255), (255, 255, 255))
+LASER_HOT = ((40, 95, 225), (110, 175, 255), (200, 232, 255), (255, 255, 255))  # flicker frames
+LASER_TIP_GLOW = ((70, 140, 250), (170, 220, 255), (255, 255, 255))  # solid circles, outside in
+LASER_HIT_GLOW = ((60, 120, 235), (160, 210, 255), (255, 255, 255))
+EYE_GLOW = ((80, 160, 250), (180, 228, 255), (255, 255, 255))
 DEATH_FADE_MS = 900          # Archie flickers, whites out and fades
 DEATH_MSG_MS = 1000          # then the EXTERMINATED! panel
 DEATH_FADE_LEVELS = 16
-# (No full-window flash on the shot: it washed every hedge block white for a
-# moment, and its surface-alpha blit is the one drawing path that can differ
-# between pygame builds/CPUs. The beam, its glows and Archie's white flicker
-# are all plain per-pixel-alpha blits of pre-built surfaces.)
-GLOW_SIZES = 24              # pre-scaled glow sizes (no transforms while drawing)
+# (No full-window flash on the shot. The beam and its glows are solid draw
+# calls; everything is drawn into an opaque back buffer, never with alpha
+# straight onto the window surface - see Game.draw.)
 PUFF_LEVELS = 12
 DISGUISE_MS = 4000
 DISGUISE_COOLDOWN_MS = 3000
@@ -768,42 +773,6 @@ def _faded_silhouettes(image: pygame.Surface, levels: int):
     return [_alpha_scaled(white, 1.0 - i / (levels - 1)) for i in range(levels)]
 
 
-# The laser beam, outermost layer first: (half-width px at jitter 1, colour, peak alpha).
-BEAM_LAYERS = ((9.0, (40, 90, 220), 70), (5.0, (70, 140, 250), 130), (2.5, (160, 210, 255), 210), (1.2, (255, 255, 255), 255))
-
-
-def _beam_layer(start, end, jitter: float, fade: float):
-    """The beam as an explicit RGBA array: each pixel's distance to the line
-    gives soft layered alphas (blue halo, white core), composited "over" in
-    numpy. Every pixel's alpha is written by us, so nothing outside the beam
-    can come out opaque on any pygame/SDL build. Returns (surface, left, top)."""
-    x0, y0 = start
-    x1, y1 = end
-    pad = int(BEAM_LAYERS[0][0] * 1.3 + 4)
-    left = int(min(x0, x1)) - pad
-    top = int(min(y0, y1)) - pad
-    w = int(abs(x1 - x0)) + pad * 2 + 1
-    h = int(abs(y1 - y0)) + pad * 2 + 1
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    xs += left + 0.5
-    ys += top + 0.5
-    dx, dy = x1 - x0, y1 - y0
-    len2 = max(1e-6, dx * dx + dy * dy)
-    u = np.clip(((xs - x0) * dx + (ys - y0) * dy) / len2, 0.0, 1.0)
-    dist = np.hypot(xs - (x0 + u * dx), ys - (y0 + u * dy))
-    a_out = np.zeros((h, w), np.float32)
-    rgb = np.zeros((h, w, 3), np.float32)  # premultiplied
-    for half, colour, peak in BEAM_LAYERS:
-        r = max(0.8, half * jitter)
-        a = np.clip(1.0 - dist / r, 0.0, 1.0) ** 0.8 * (peak / 255.0) * fade
-        rgb = np.array(colour, np.float32) * a[..., None] + rgb * (1.0 - a[..., None])
-        a_out = a + a_out * (1.0 - a)
-    arr = np.zeros((h, w, 4), np.uint8)
-    arr[..., :3] = np.clip(rgb / np.maximum(a_out, 1e-6)[..., None], 0, 255).astype(np.uint8)
-    arr[..., 3] = np.clip(a_out * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    return _rgba_from_array(arr), left, top
-
-
 def _make_glow(radius: int, colour, strength: float = 1.0) -> pygame.Surface:
     """Soft radial glow as a per-pixel-alpha sprite, blitted normally (no blend
     flags): colour fading out from a whiter centre, alpha falling to 0."""
@@ -817,25 +786,6 @@ def _make_glow(radius: int, colour, strength: float = 1.0) -> pygame.Surface:
     arr[..., :3] = rgb.clip(0, 255).astype(np.uint8)
     arr[..., 3] = (255.0 * strength * fall ** 1.6).clip(0, 255).astype(np.uint8)
     return _rgba_from_array(arr)
-
-
-def _glow_sizes(glow: pygame.Surface, smallest: int = 4):
-    """The glow pre-scaled to GLOW_SIZES sizes, smallest to full size."""
-    full = glow.get_width()
-    out = []
-    for i in range(GLOW_SIZES):
-        size = max(smallest, int(round(smallest + (full - smallest) * i / (GLOW_SIZES - 1))))
-        out.append(_finish_rgba(pygame.transform.smoothscale(glow, (size, size))))
-    return out
-
-
-def _pick_size(sizes, want: float):
-    full = sizes[-1].get_width()
-    small = sizes[0].get_width()
-    if full == small:
-        return sizes[-1]
-    i = int(round((want - small) / (full - small) * (len(sizes) - 1)))
-    return sizes[max(0, min(len(sizes) - 1, i))]
 
 
 class Sounds:
@@ -1062,14 +1012,15 @@ class Game:
         # scaled with numpy) and a lamp glow at a few brightness levels.
         self.demat_fades = [_alpha_scaled(self.tardis, i / (DEMAT_LEVELS - 1)) for i in range(DEMAT_LEVELS)]
         self.demat_shadows = [_alpha_scaled(self.tardis_shadow, i / (DEMAT_LEVELS - 1)) for i in range(DEMAT_LEVELS)]
-        lamp = _make_glow(11, (255, 236, 190))
+        if os.path.exists(LAMP_GLOW_FILE):
+            lamp = pygame.image.load(LAMP_GLOW_FILE).convert_alpha()
+        else:  # (run tools/make_fx.py to write it)
+            lamp = _make_glow(11, (255, 236, 190))
         self.demat_lamps = [_alpha_scaled(lamp, i / 11) for i in range(12)]
         self.scorch = _new_rgba((34, 14))
         pygame.draw.ellipse(self.scorch, (20, 12, 6, 170), self.scorch.get_rect())
         pygame.draw.ellipse(self.scorch, (10, 6, 4, 200), self.scorch.get_rect().inflate(-14, -6))
         self.scorch = _finish_rgba(self.scorch)
-        self.glow_eye = _glow_sizes(_make_glow(int(13 * ZOOM), (190, 235, 255)))
-        self.glow_hit = _glow_sizes(_make_glow(int(16 * ZOOM), (140, 200, 255)))
         self.puffs = []  # puffs[size][alpha level], pre-faded
         for radius in (2, 3, 4, 5, 6):
             puff = _new_rgba((radius * 2 + 2, radius * 2 + 2))
@@ -1086,6 +1037,7 @@ class Game:
         self.view_w = max(1, int(round(WIN_W / ZOOM)))
         self.view_h = max(1, int(round(WIN_H / ZOOM)))
         self.view = pygame.Surface((self.view_w, self.view_h)).convert()
+        self.frame = None  # opaque window-sized back buffer, made on the first draw
         self.font_hint = load_font(18)
         self.font_big = load_font(36, bold=True)
         self.font_small = load_font(20)
@@ -1923,7 +1875,18 @@ class Game:
         tiles.sort()
         return tiles
 
-    def draw(self, screen: pygame.Surface, now: float):
+    def draw(self, window: pygame.Surface, now: float):
+        """Everything is drawn into self.frame, an opaque back buffer made
+        like the world surface, and copied to the window in one opaque blit.
+
+        Nothing with per-pixel alpha is ever blitted straight onto the window
+        surface: on some systems that surface has an alpha channel which ends
+        up 0, and pygame then copies source pixels verbatim instead of
+        blending them (transparent parts of glows, text and the laser showed
+        as black or coloured boxes)."""
+        if self.frame is None or self.frame.get_size() != window.get_size():
+            self.frame = pygame.Surface(window.get_size()).convert()
+        screen = self.frame
         view = self.view
         self._draw_world(view, now)
         if view.get_size() == screen.get_size():
@@ -1942,6 +1905,7 @@ class Game:
             self._draw_panel(screen, "EXTERMINATED!", f"You reached level {self.level}.  Press Enter to start again", (255, 96, 72))
         self._draw_banners(screen, now)
         self._draw_card(screen, now)
+        window.blit(screen, (0, 0))
 
     def _draw_world(self, screen: pygame.Surface, now: float):
         screen.fill(BG_COLOUR)
@@ -2232,10 +2196,7 @@ class Game:
                 u = max(0.0, min(1.0, (now - d.aim_t0) / max(1.0, d.fire_at - d.aim_t0)))
                 ex, ey = self._to_window(*self._dalek_point(d, now, self.dalek_eye))
                 flick = 0.75 + 0.25 * math.sin(now * 0.06)
-                full = self.glow_eye[-1].get_width()
-                glow = _pick_size(self.glow_eye, full * (0.45 + 0.75 * u) * flick)
-                size = glow.get_width()
-                screen.blit(glow, (int(ex - size / 2), int(ey - size / 2)))
+                self._solid_glow(screen, ex, ey, (3.0 + 6.0 * u) * flick, EYE_GLOW)
             if d.state == "aim" or (d.state == "fire" and now - d.fire_t0 < LASER_MS + 400):
                 self._draw_shout(screen, d, now)
         if self.dead and self.shooter is not None:
@@ -2259,20 +2220,32 @@ class Game:
             screen.blit(bg, (bx + ox, by + oy))
         screen.blit(fg, (bx, by))
 
+    def _solid_glow(self, screen, x: float, y: float, radius: float, colours):
+        """A glow impression from solid concentric circles (no alpha)."""
+        c = (int(round(x)), int(round(y)))
+        for k, colour in zip((1.0, 0.72, 0.45), colours):
+            r = int(round(radius * k))
+            if r >= 1:
+                pygame.draw.circle(screen, colour, c, r)
+
     def _draw_laser(self, screen, start, end, now: float, t: float):
+        """Solid opaque lines straight onto the frame, wide dark blue to a thin
+        white core, flickering in width and colour; solid circles at the gun
+        tip and the hit point. No intermediate surface, no alpha."""
         rng = random.Random(int(now // 33))
-        x0, y0 = start
-        x1, y1 = end
         fade = 1.0 if t < LASER_MS * 0.6 else max(0.0, 1.0 - (t - LASER_MS * 0.6) / (LASER_MS * 0.4))
-        j = rng.uniform(0.7, 1.25) * max(0.3, fade)
-        if fade > 0.01:
-            layer, left, top = _beam_layer(start, end, j, fade)
-            screen.blit(layer, (left, top))
-        for (px, py), sizes in (((x0, y0), self.glow_eye), ((x1, y1), self.glow_hit)):
-            if fade <= 0.05:
-                continue
-            g = _pick_size(sizes, sizes[-1].get_width() * rng.uniform(0.8, 1.15) * fade)
-            screen.blit(g, (int(px - g.get_width() / 2), int(py - g.get_height() / 2)))
+        if fade <= 0.05:
+            return
+        a = (int(round(start[0])), int(round(start[1])))
+        b = (int(round(end[0])), int(round(end[1])))
+        j = rng.uniform(0.75, 1.25)
+        hot = rng.random() < 0.5  # flicker between two palettes
+        for width, colour in zip(LASER_WIDTHS, LASER_HOT if hot else LASER_COLOURS):
+            w = int(round(width * j * fade))
+            if w >= 1:
+                pygame.draw.line(screen, colour, a, b, w)
+        self._solid_glow(screen, a[0], a[1], 6.0 * j * fade, LASER_TIP_GLOW)
+        self._solid_glow(screen, b[0], b[1], 8.0 * rng.uniform(0.8, 1.15) * fade, LASER_HIT_GLOW)
 
     def _draw_disguise_hud(self, screen, now: float):
         if self.disguised:
