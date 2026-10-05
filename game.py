@@ -164,15 +164,15 @@ SOUND_FILES.update({"rustle": "rustle.wav", "cloak_on": "cloak_on.wav", "cloak_o
 TARDIS_REAL_FILES = ("tardis_real.wav", "tardis_real.ogg", "tardis_real.mp3")
 TARDIS_REAL_VOLUME = 0.7
 SOUND_VOLUME = {
-    "ow": 0.38, "exterminate": 0.9, "laser": 0.7,
+    "ow": 0.28, "exterminate": 0.9, "laser": 0.7,
     "step1": 0.45, "step2": 0.45, "step3": 0.45,
     "rustle": 0.30, "cloak_on": 0.5, "cloak_off": 0.5,
     "tardis_demat": 0.6,
 }
 STEP_SOUNDS = ("step1", "step2", "step3")
-OW_BUMPS = 3                 # "ow" on the 3rd hedge bump ...
-OW_WINDOW_MS = 2000          # ... within 2 s; single bumps only rustle
-OW_QUIET_MS = 2000           # after an "ow", bumps just rustle for a while
+OW_BUMPS = 5                 # "ow" on the 5th hedge bump ...
+OW_WINDOW_MS = 2500          # ... within 2.5 s; single bumps only rustle
+OW_QUIET_MS = 3000           # after an "ow", bumps just rustle for a while
 BUMP_COUNT_GAP_MS = 250      # held-key repeats count, but at most 4 a second
 RUSTLE_GAP_MS = 450          # the soft rustle at most about twice a second
 # Dalek proximity hum: one looping channel per Dalek, reserved so effects
@@ -181,6 +181,12 @@ RUSTLE_GAP_MS = 450          # the soft rustle at most about twice a second
 HUM_FILE = "dalek_hum.wav"
 TITLE_THEME_FILE = "title_theme.wav"
 TITLE_THEME_VOLUME = 0.55
+TITLE_COPYRIGHT = (
+    "©2026 Nathan, Archie & Holly Anderson. Doctor Who, the TARDIS, the Daleks, "
+    "and related sound effects are trademarks and copyright of the BBC/BBC Studios. "
+    "Dalek is also associated with the estate of Terry Nation. All rights in those "
+    "works remain with their respective owners."
+)
 HUM_CHANNELS = 4             # reserved hum channels, given to the loudest Daleks
 HUM_MAX = 0.5                # channel volume when a Dalek is right next to Archie
 HUM_FAR = 25.0               # silent at this effective distance (cells) ...
@@ -1005,16 +1011,150 @@ class Dalek:
         return FACING_SPRITE[self.facing]
 
 
+
+def _clear_holly_leg_gap(image: pygame.Surface) -> pygame.Surface:
+    """Clear the narrow white/grey fill between Holly's legs.
+
+    Keeps the white dress (and its blue polka dots) fully opaque, and leaves
+    white socks/shoes alone. Only a tight corridor between the two skin-leg
+    runs, just under the dress hem, is made transparent. Safe to run more
+    than once.
+    """
+    out = image.copy()
+    rgb = pygame.surfarray.pixels3d(out)
+    alpha = pygame.surfarray.pixels_alpha(out)
+    # surfarray is (x, y, ...); work in that layout then write back.
+    r = rgb[..., 0].astype(np.int16)
+    g = rgb[..., 1].astype(np.int16)
+    b = rgb[..., 2].astype(np.int16)
+    a = alpha
+    w, h = out.get_size()
+
+    skin = (
+        (a > 64) & (r > 155) & (g > 85) & (b < 155)
+        & (r > g) & (g > b - 35) & (r - b > 40)
+    )
+    blue_dot = (
+        (a > 64) & (b > r + 12) & (b > g + 8)
+        & (b - ((r + g) // 2) > 15)
+    )
+    light = (
+        (a > 8) & (r > 120) & (g > 120) & (b > 120)
+        & (np.abs(r - g) < 45) & (np.abs(g - b) < 45) & (np.abs(r - b) < 50)
+        & ~skin & ~blue_dot
+    )
+
+    def skin_runs(y):
+        xs = np.where(skin[:, y])[0]
+        if len(xs) < 2:
+            return []
+        runs, start, prev = [], int(xs[0]), int(xs[0])
+        for x in xs[1:]:
+            x = int(x)
+            if x == prev + 1:
+                prev = x
+            else:
+                runs.append((start, prev))
+                start = prev = x
+        runs.append((start, prev))
+        return runs
+
+    hem_y = int(h * 0.68)
+    for y in range(int(h * 0.55), int(h * 0.78)):
+        row = light[:, y]
+        best = cur = 0
+        for x in range(w):
+            if row[x]:
+                cur += 1
+                best = max(best, cur)
+            else:
+                cur = 0
+        if best >= 10:
+            hem_y = y
+
+    gaps = []
+    for y in range(hem_y + 1, int(h * 0.86)):
+        runs = skin_runs(y)
+        if len(runs) < 2:
+            continue
+        le, rs = runs[0][1], runs[-1][0]
+        if 1 <= rs - le - 1 <= 8:
+            gaps.append((y, le, rs))
+    if not gaps:
+        del rgb, alpha
+        return out
+
+    L = int(np.median([g[1] for g in gaps]))
+    R = int(np.median([g[2] for g in gaps]))
+    if R - L - 1 < 1:
+        del rgb, alpha
+        return out
+
+    y0 = max(hem_y, gaps[0][0] - 2)
+    y1 = min(int(h * 0.86), gaps[-1][0] + 1)
+    cleared = np.zeros((w, h), dtype=bool)
+    for y in range(y0, y1 + 1):
+        runs = skin_runs(y)
+        if len(runs) >= 2:
+            le, rs = runs[0][1], runs[-1][0]
+            lo, hi = (le, rs) if 1 <= rs - le - 1 <= 8 else (L, R)
+        else:
+            lo, hi = L, R
+        for x in range(lo + 1, hi):
+            if light[x, y]:
+                cleared[x, y] = True
+
+    for x in range(L + 1, R):
+        if not light[x, hem_y]:
+            continue
+        xl = xr = x
+        while xl > 0 and light[xl - 1, hem_y]:
+            xl -= 1
+        while xr < w - 1 and light[xr + 1, hem_y]:
+            xr += 1
+        if xr - xl + 1 <= 8:
+            cleared[x, hem_y] = True
+
+    alpha[cleared] = 0
+    del rgb, alpha
+    return out
+
+
+
+def _wrap_text(font: pygame.font.Font, text: str, max_width: int) -> list[str]:
+    """Greedy word-wrap: break so each line fits max_width pixels."""
+    words = text.split()
+    if not words:
+        return []
+    lines, cur = [], words[0]
+    for word in words[1:]:
+        trial = cur + " " + word
+        if font.size(trial)[0] <= max_width:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+    lines.append(cur)
+    return lines
+
+
 def _load_char_sprites(files: dict):
     """Scale a character's facing PNGs to SPRITE_H and return (sprites, anchors, white)."""
     sprites, anchors = {}, {}
     for key, path in files.items():
         image = pygame.image.load(path).convert_alpha()
+        # Holly: clear the tiny white crotch/between-legs gap (dress stays opaque).
+        # Run before and after scale — nearest-neighbour downscale can refill the gap.
+        is_holly = "holly" in os.path.basename(path).lower()
+        if is_holly:
+            image = _clear_holly_leg_gap(image)
         h = image.get_height()
         if h != SPRITE_H:
             w = max(1, round(image.get_width() * SPRITE_H / h))
             # Nearest-neighbour keeps white dress pixels solid (smoothscale muddy them).
             image = _finish_rgba(pygame.transform.scale(image, (w, SPRITE_H)))
+        if is_holly:
+            image = _clear_holly_leg_gap(image)
         sprites[key] = image
         anchors[key] = _feet_anchor(image)
     white = {key: _faded_silhouettes(image, DEATH_FADE_LEVELS) for key, image in sprites.items()}
@@ -1110,6 +1250,7 @@ class Game:
         self.font_title_sub = load_font(14)            # "Choose Archie or Holly"
         self.font_title_help = load_font(11)           # controls help on title
         self.font_title_sel = load_font(11, bold=True) # SELECTED
+        self.font_title_copy = load_font(8)              # title-screen copyright
         self.font_big = load_font(18, bold=True)
         self.font_small = load_font(10)
         self.font_shout = load_font(8, bold=True)
@@ -2581,20 +2722,25 @@ class Game:
         sub = self.font_title_sub.render("Choose Archie or Holly", True, (220, 200, 160))
         screen.blit(sub, ((self.view_w - sub.get_width()) // 2, 7 + title.get_height() + 4))
 
-        # Portraits
-        gap = 28
+        # Portraits — boxes sized for the larger title fonts (name under each).
+        pad_x, pad_top, pad_bot = 20, 14, 34
+        gap = 44
         portraits = []
         for i, cid in enumerate(CHAR_ORDER):
             portraits.append((cid, self.char_sets[cid]))
-        total_w = sum(cs["portrait"].get_width() for _, cs in portraits) + gap
-        x0 = (self.view_w - total_w) // 2
+        # Centre by the highlight frames (wider than the sprites).
+        total_w = sum(cs["portrait"].get_width() + pad_x * 2 for _, cs in portraits) + gap
+        x0 = (self.view_w - total_w) // 2 + pad_x
         y0 = self.view_h // 2 - 50
         for i, (cid, cs) in enumerate(portraits):
             img = cs["portrait"]
             selected = i == self.title_pick
-            bx = x0 - 6
-            by = y0 - 6
-            bw, bh = img.get_width() + 12, img.get_height() + 28
+            name = self.font_title_sub.render(cs["name"], True, (255, 236, 170) if selected else (200, 180, 140))
+            content_w = max(img.get_width(), name.get_width())
+            bw = content_w + pad_x * 2
+            bh = pad_top + img.get_height() + pad_bot
+            bx = x0 + (img.get_width() - content_w) // 2 - pad_x
+            by = y0 - pad_top
             frame = _new_rgba((bw, bh))
             frame.fill((36, 24, 16, 210 if selected else 150))
             border = (255, 220, 120, 255) if selected else (140, 110, 70, 180)
@@ -2602,12 +2748,11 @@ class Game:
             frame = _finish_rgba(frame)
             screen.blit(frame, (bx, by))
             screen.blit(img, (x0, y0))
-            name = self.font_title_sub.render(cs["name"], True, (255, 236, 170) if selected else (200, 180, 140))
-            screen.blit(name, (x0 + (img.get_width() - name.get_width()) // 2, y0 + img.get_height() + 4))
+            screen.blit(name, (x0 + (img.get_width() - name.get_width()) // 2, y0 + img.get_height() + 8))
             if selected:
                 mark = self.font_title_sel.render("SELECTED", True, (255, 220, 120))
-                screen.blit(mark, (x0 + (img.get_width() - mark.get_width()) // 2, by - 14))
-            x0 += img.get_width() + gap
+                screen.blit(mark, (bx + (bw - mark.get_width()) // 2, by - 14))
+            x0 += img.get_width() + pad_x * 2 + gap
 
         mute = "M unmute" if self.sfx.muted else "M mute"
         lines = [
@@ -2615,11 +2760,21 @@ class Game:
             "Enter / Space: start",
             "In game: Left/Right turn, Up/Down step, H Chameleon Cloak, " + mute,
         ]
-        y = self.view_h - 10 - 14 * len(lines)
+        # Copyright at the very bottom (wrapped); controls sit just above it.
+        copy_margin = 8
+        copy_gap = 10  # line height for size-8 font on the low-res view
+        copy_lines = _wrap_text(self.font_title_copy, TITLE_COPYRIGHT, self.view_w - copy_margin * 2)
+        copy_block_h = copy_gap * len(copy_lines)
+        copy_y0 = self.view_h - 6 - copy_block_h
+        help_y = copy_y0 - 6 - 14 * len(lines)
+        y = help_y
         for line in lines:
             t = self.font_title_help.render(line, True, (230, 214, 180))
             screen.blit(t, ((self.view_w - t.get_width()) // 2, y))
             y += 14
+        for i, line in enumerate(copy_lines):
+            t = self.font_title_copy.render(line, True, (180, 165, 130))
+            screen.blit(t, ((self.view_w - t.get_width()) // 2, copy_y0 + i * copy_gap))
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Daleks in Hedges")
