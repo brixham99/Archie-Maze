@@ -40,11 +40,35 @@ def save_png(arr: np.ndarray, name: str):
     print("wrote", os.path.relpath(path, ROOT), f"{w}x{h}")
 
 
+def chameleon_cloak():
+    """Oval badge with a green gem and a charge slot along the bottom."""
+    W, H = 48, 56
+    yy, xx = np.mgrid[0:H, 0:W]
+    cx, cy = W / 2, H / 2 - 2
+    arr = np.zeros((H, W, 4), np.uint8)
+    body = ((xx - cx) / 18) ** 2 + ((yy - cy) / 22) ** 2 <= 1.0
+    rim = (((xx - cx) / 20) ** 2 + ((yy - cy) / 24) ** 2 <= 1.0) & ~body
+    arr[rim] = (186, 150, 70, 255)
+    arr[body] = (48, 58, 72, 255)
+    inner = ((xx - cx) / 14) ** 2 + ((yy - cy) / 16) ** 2 <= 1.0
+    arr[inner] = (36, 44, 56, 255)
+    gem = (xx - cx) ** 2 + (yy - cy + 2) ** 2 <= 36
+    arr[gem] = (70, 196, 110, 255)
+    gem2 = (xx - cx) ** 2 + (yy - cy + 2) ** 2 <= 12
+    arr[gem2] = (180, 255, 200, 255)
+    arr[H - 10:H - 4, 10:W - 10] = (20, 14, 10, 255)
+    arr[H - 9:H - 5, 11:W - 11] = (40, 120, 60, 255)
+    for px, py in ((cx - 12, cy - 14), (cx + 12, cy - 14), (cx - 12, cy + 12), (cx + 12, cy + 12)):
+        arr[(xx - px) ** 2 + (yy - py) ** 2 <= 4] = (212, 180, 90, 255)
+    return arr
+
+
 def main() -> int:
     os.makedirs(FX_DIR, exist_ok=True)
     pygame.init()
     # The TARDIS roof-lamp glow (start and exit dematerialisation).
     save_png(radial_glow(11, (255, 236, 190)), "lamp_glow.png")
+    save_png(chameleon_cloak(), "chameleon_cloak.png")
     pygame.quit()
     return 0
 

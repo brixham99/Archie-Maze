@@ -66,21 +66,26 @@ N_DIRT = 16
 DIRT_SHADES = (0.90, 0.97, 1.03)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SPRITE_FILES = {
-    "se": os.path.join(HERE, "assets", "archie_se.png"),
-    "sw": os.path.join(HERE, "assets", "archie_sw.png"),
-    "nw": os.path.join(HERE, "assets", "archie_nw.png"),
-    "ne": os.path.join(HERE, "assets", "archie_ne.png"),
-    "n": os.path.join(HERE, "assets", "archie_n.png"),
-    "e": os.path.join(HERE, "assets", "archie_e.png"),
-    "w": os.path.join(HERE, "assets", "archie_w.png"),
+# Four facing sprites per character (same keys FACING_SPRITE uses).
+CHARACTERS = {
+    "archie": {
+        "name": "Archie",
+        "files": {k: os.path.join(HERE, "assets", f"archie_{k}.png") for k in ("se", "sw", "nw", "ne")},
+    },
+    "holly": {
+        "name": "Holly",
+        "files": {k: os.path.join(HERE, "assets", f"holly_{k}.png") for k in ("se", "sw", "nw", "ne")},
+    },
 }
+CHAR_ORDER = ("archie", "holly")
+TITLE_DALEKS = 10             # decorative Daleks on the title screen
 
 DALEK_FILES = {k: os.path.join(HERE, "assets", f"dalek_{k}.png") for k in ("se", "sw", "ne", "nw")}
 TARDIS_FILE = os.path.join(HERE, "assets", "tardis.png")
 LAMP_GLOW_FILE = os.path.join(HERE, "assets", "fx", "lamp_glow.png")  # tools/make_fx.py
+CLOAK_FILE = os.path.join(HERE, "assets", "fx", "chameleon_cloak.png")
 
-# --- Daleks, the TARDIS and the hedge disguise (pre-zoom pixels, ms) ---
+# --- Daleks, the TARDIS and the Chameleon Cloak (pre-zoom pixels, ms) ---
 DALEK_H = 86                 # Archie is SPRITE_H = 74
 TARDIS_H = 124
 NUM_DALEKS = 3               # on level 1; each level adds two more ...
@@ -93,7 +98,7 @@ DALEK_TELEGRAPH_MS = 350     # eye-stalk glow before the shot
 DALEK_MIN_START_DIST = 12    # path distance from Archie's start
 DALEK_MIN_EXIT_DIST = 10     # path distance from the exit
 LASER_MS = 450               # how long the beam stays on screen
-LASER_WIDTHS = (7, 5, 3, 1)  # px at window resolution: solid lines, widest first
+LASER_WIDTHS = (4, 3, 2, 1)  # px on the low-res view (nearest-neighbour 2x to the window)
 LASER_COLOURS = ((30, 70, 190), (70, 140, 250), (160, 210, 255), (255, 255, 255))
 LASER_HOT = ((40, 95, 225), (110, 175, 255), (200, 232, 255), (255, 255, 255))  # flicker frames
 LASER_TIP_GLOW = ((70, 140, 250), (170, 220, 255), (255, 255, 255))  # solid circles, outside in
@@ -137,7 +142,7 @@ CARD_FADE_MS = 450           # fade to black, the new maze is made ...
 CARD_HOLD_MS = 1000          # ... "Level N" on black ...
 LEVEL_BANNER_MS = 2600       # "Level N" banner at the start of a level
 COMPLETE_TEXT = "Level complete!"
-COMPLETE_SIZE = 40           # plain white text with a soft drop shadow, window resolution
+COMPLETE_SIZE = 20           # plain white text on the low-res view (chunky when 2x scaled)
 COMPLETE_Y = 0.2             # its top, as a fraction of the window height (clear of the TARDIS)
 COMPLETE_FADE_IN_MS = 300
 COMPLETE_FADE_OUT_MS = 400
@@ -963,23 +968,51 @@ class Dalek:
         return FACING_SPRITE[self.facing]
 
 
+def _load_char_sprites(files: dict):
+    """Scale a character's facing PNGs to SPRITE_H and return (sprites, anchors, white)."""
+    sprites, anchors = {}, {}
+    for key, path in files.items():
+        image = pygame.image.load(path).convert_alpha()
+        h = image.get_height()
+        if h != SPRITE_H:
+            w = max(1, round(image.get_width() * SPRITE_H / h))
+            image = _finish_rgba(pygame.transform.smoothscale(image, (w, SPRITE_H)))
+        sprites[key] = image
+        anchors[key] = _feet_anchor(image)
+    white = {key: _faded_silhouettes(image, DEATH_FADE_LEVELS) for key, image in sprites.items()}
+    return sprites, anchors, white
+
+
+def _make_cloak_icon() -> pygame.Surface:
+    """Fallback Chameleon Cloak badge if the PNG is missing."""
+    W, H = 48, 56
+    surf = _new_rgba((W, H))
+    pygame.draw.ellipse(surf, (186, 150, 70, 255), (4, 2, 40, 48))
+    pygame.draw.ellipse(surf, (48, 58, 72, 255), (8, 6, 32, 40))
+    pygame.draw.ellipse(surf, (70, 196, 110, 255), (16, 16, 16, 16))
+    pygame.draw.ellipse(surf, (180, 255, 200, 255), (20, 20, 8, 8))
+    pygame.draw.rect(surf, (20, 14, 10, 255), (10, H - 10, W - 20, 6))
+    pygame.draw.rect(surf, (40, 120, 60, 255), (11, H - 9, W - 22, 4))
+    return _finish_rgba(surf)
+
+
 class Game:
-    def __init__(self, seed: int | None, level: int = 1):
-        self.sprites = {}
-        self.anchors = {}
-        for key, path in SPRITE_FILES.items():
-            image = pygame.image.load(path).convert_alpha()
-            h = image.get_height()
-            if h != SPRITE_H:
-                w = max(1, round(image.get_width() * SPRITE_H / h))
-                image = _finish_rgba(pygame.transform.smoothscale(image, (w, SPRITE_H)))
-            self.sprites[key] = image
-            self.anchors[key] = _feet_anchor(image)
-        # White silhouettes for the death flicker, pre-faded. Built with numpy so
-        # only Archie's own pixels turn white and the alpha is copied exactly
-        # (no blend-mode fills or set_alpha on per-pixel-alpha surfaces, whose
-        # behaviour differs between pygame builds and can whiten the whole rect).
-        self.white = {key: _faded_silhouettes(image, DEATH_FADE_LEVELS) for key, image in self.sprites.items()}
+    def __init__(self, seed: int | None, level: int = 1, character: str = "archie", title: bool = True):
+        self.char_sets = {}
+        for cid, info in CHARACTERS.items():
+            sprites, anchors, white = _load_char_sprites(info["files"])
+            # Large SE portrait for the title screen (smoothscale once; then drawn
+            # on the low-res view so the 2x nearest scale makes it chunky).
+            se = sprites["se"]
+            ph = 110
+            pw = max(1, round(se.get_width() * ph / se.get_height()))
+            portrait = _finish_rgba(pygame.transform.smoothscale(se, (pw, ph)))
+            self.char_sets[cid] = {
+                "name": info["name"], "sprites": sprites, "anchors": anchors,
+                "white": white, "portrait": portrait,
+            }
+        self.character = character if character in self.char_sets else "archie"
+        self._apply_character(self.character)
         self.dalek_sprites = {}
         self.dalek_anchor = {}
         self.dalek_gun = {}
@@ -1038,19 +1071,24 @@ class Game:
         self.view_h = max(1, int(round(WIN_H / ZOOM)))
         self.view = pygame.Surface((self.view_w, self.view_h)).convert()
         self.frame = None  # opaque window-sized back buffer, made on the first draw
-        self.font_hint = load_font(18)
-        self.font_big = load_font(36, bold=True)
-        self.font_small = load_font(20)
-        self.font_shout = load_font(16, bold=True)
-        self.font_hud = load_font(16)
+        # Fonts sized for the low-res view; they look chunky after nearest 2x.
+        self.font_title = load_font(22, bold=True)
+        self.font_big = load_font(18, bold=True)
+        self.font_small = load_font(10)
+        self.font_shout = load_font(8, bold=True)
+        self.font_hud = load_font(8)
+        self.font_hint = load_font(8)
         self.cam = (0.0, 0.0)
         self.archie_feet = (0, 0)
         self.sfx = Sounds()
         self.given_seed = seed
         self.level = max(1, int(level))
-        # Full-window fade for the level card: a per-pixel-alpha surface filled
-        # with translucent black (same kind of blit as the HUD boxes).
-        self.fader = _finish_rgba(_new_rgba((WIN_W, WIN_H)))  # filled with RGBA each frame
+        if os.path.exists(CLOAK_FILE):
+            self.cloak_icon = pygame.image.load(CLOAK_FILE).convert_alpha()
+        else:
+            self.cloak_icon = _make_cloak_icon()
+        # Level-card fade on the low-res view.
+        self.fader = _finish_rgba(_new_rgba((self.view_w, self.view_h)))
         self.complete_fades = _shadowed_text_fades(load_font(COMPLETE_SIZE, bold=True), COMPLETE_TEXT, 16)
         self.archie_fades = {}    # (sprite key, level) -> faded copy, for walking into the TARDIS
         self.hum_gain = 1.0
@@ -1059,10 +1097,85 @@ class Game:
         self.hum_assign = [None] * HUM_CHANNELS
         self.hum_ch_gain = [0.0] * HUM_CHANNELS
         self.hum_releasing = [False] * HUM_CHANNELS
-        self.reset(seed if seed is not None else (time.time_ns() & 0x7FFFFFFF))
+        self.mode = "title" if title else "play"
+        self.title_pick = CHAR_ORDER.index(self.character) if self.character in CHAR_ORDER else 0
+        seed0 = seed if seed is not None else (time.time_ns() & 0x7FFFFFFF)
+        if self.mode == "title":
+            self._enter_title(seed0)
+        else:
+            self.reset(seed0)
+
+    def _apply_character(self, character: str):
+        """Switch the active sprite set (Archie or Holly)."""
+        self.character = character if character in self.char_sets else "archie"
+        cs = self.char_sets[self.character]
+        self.char_name = cs["name"]
+        self.sprites = cs["sprites"]
+        self.anchors = cs["anchors"]
+        self.white = cs["white"]
+        self.archie_fades = {}
+
+    def _enter_title(self, seed: int | None = None):
+        """Decorative maze with TITLE_DALEKS Daleks; no player, no deaths."""
+        self.mode = "title"
+        self.level = 1
+        self.card_t0 = None
+        self.card_switched = False
+        self.banner = False
+        self.won = False
+        self.dead = False
+        self.disguised = False
+        self.disguise_pending = False
+        self.exit_t0 = None
+        self.exit_demat_t0 = None
+        self.num_daleks = TITLE_DALEKS
+        self.seed = (seed if seed is not None else time.time_ns()) & 0x7FFFFFFF
+        self.grid = generate_maze(MAZE_SIZE, self.seed)
+        self.hedge_variant = hedge_variant_grid(self.grid, self.seed)
+        self.exit_cell = (MAZE_SIZE - 2, MAZE_SIZE - 2)
+        self.demat_cell = (1, 1)
+        start_dir = next(d for d in DIR_ORDER if self.is_open(1 + d[0], 1 + d[1]))
+        self.start_cell = (1 + start_dir[0], 1 + start_dir[1])
+        # Camera follows a quiet open cell near the middle of the maze.
+        mid = MAZE_SIZE // 2
+        open_cells = [(c, r) for r in range(MAZE_SIZE) for c in range(MAZE_SIZE)
+                      if self.grid[r][c] == PATH]
+        self.col, self.row = min(open_cells, key=lambda p: abs(p[0] - mid) + abs(p[1] - mid))
+        self.src = self.dst = (self.col, self.row)
+        self.facing_index = 0
+        self.facing = self.turn_from = DIR_ORDER[0]
+        self.turning = self.moving = False
+        self.wish = self.queued = self.bump_dir = None
+        self.last_now = None
+        self.start_t0 = None
+        self.demat_t0 = None  # no start demat on the title screen
+        self.demat_len = DEMAT_MS
+        if self.sfx.demat_source != "tardis_demat.wav":
+            real = self.sfx.length_ms("tardis_demat", DEMAT_MS)
+            self.demat_len = max(DEMAT_MIN_MS, min(DEMAT_MAX_MS, real))
+        self.sfx.stop_all()
+        self.hum_assign = [None] * HUM_CHANNELS
+        self.hum_ch_gain = [0.0] * HUM_CHANNELS
+        self.hum_releasing = [False] * HUM_CHANNELS
+        self._hum_from = None
+        self._hum_dist = {}
+        self.daleks = []
+        self._spawn_daleks()
+        # Title Daleks never aim/fire: keep them roaming forever.
+        for d in self.daleks:
+            d.state = "roam"
+
+    def _start_game(self, now: float):
+        """Leave the title screen and begin level 1 with the selected character."""
+        self._apply_character(CHAR_ORDER[self.title_pick])
+        self.mode = "play"
+        self.level = 1
+        self.reset(time.time_ns() & 0x7FFFFFFF, banner=True)
+        self.start_t0 = now
+        self.last_now = now
 
     def reset(self, seed: int, banner: bool = True):
-        """A new maze for self.level (level 1 after a death, or the next level)."""
+        """A new maze for self.level (next level, or a fresh run from the title)."""
         self.sfx.stop_all()
         self.hum_assign = [None] * HUM_CHANNELS
         self.hum_ch_gain = [0.0] * HUM_CHANNELS
@@ -1193,7 +1306,7 @@ class Game:
         return cells
 
     def archie_exposed(self) -> bool:
-        return not (self.disguised or self.dead or self.won)
+        return self.mode == "play" and not (self.disguised or self.dead or self.won)
 
     def _sees(self, d: Dalek) -> bool:
         if not self.archie_exposed():
@@ -1379,6 +1492,11 @@ class Game:
     def setup_scene(self, name: str, now: float = 0.0) -> float:
         """Arrange a scene and return how long (ms) to simulate before the shot."""
         self.last_now = now
+        if name == "title":
+            self._enter_title(self.seed)
+            self.start_t0 = now
+            return 800.0
+        self.mode = "play"
         if name == "tardis_exit":
             # Archie next to the exit, stepping into the TARDIS. --scene-ms
             # counts from that step: he walks in (0.5 s), demat from 0.9 s, then the card.
@@ -1578,9 +1696,20 @@ class Game:
             return
         if self.card_t0 is not None:
             return  # the level card is showing
+        if self.mode == "title":
+            if key in (pygame.K_LEFT, pygame.K_a):
+                self.title_pick = (self.title_pick - 1) % len(CHAR_ORDER)
+            elif key in (pygame.K_RIGHT, pygame.K_d):
+                self.title_pick = (self.title_pick + 1) % len(CHAR_ORDER)
+            elif key in (pygame.K_1, pygame.K_KP1):
+                self.title_pick = 0
+            elif key in (pygame.K_2, pygame.K_KP2):
+                self.title_pick = min(1, len(CHAR_ORDER) - 1)
+            elif key in RESTART_KEYS:
+                self._start_game(now)
+            return
         if key in RESTART_KEYS and self.dead and now - self.death_t0 >= LASER_MS:
-            self.level = 1  # start again from level 1 in a new maze
-            self.reset(time.time_ns() & 0x7FFFFFFF)
+            self._enter_title()  # pick a character again
             return
         if key in DISGUISE_KEYS:
             self.toggle_disguise(now)
@@ -1592,7 +1721,7 @@ class Game:
         self.try_action(action, now)
 
     def hold_action(self, keys, now: float):
-        if self.busy() or self.won or self.dead or self.disguised or self.card_t0 is not None:
+        if self.mode != "play" or self.busy() or self.won or self.dead or self.disguised or self.card_t0 is not None:
             return
         action = self.desired_action(keys)
         if action is None:
@@ -1602,7 +1731,7 @@ class Game:
 
     def nudge(self, now: float):
         """Headless test: step forward, or turn right if that cell is shut."""
-        if self.busy() or self.won or self.dead or self.disguised:
+        if self.mode != "play" or self.busy() or self.won or self.dead or self.disguised:
             return
         dc, dr = self.facing
         if self.is_open(self.col + dc, self.row + dr):
@@ -1619,6 +1748,16 @@ class Game:
     def update(self, now: float):
         dt = 0.0 if self.last_now is None else max(0.0, min(100.0, now - self.last_now))
         self.last_now = now
+        if self.mode == "title":
+            if self.start_t0 is None:
+                self.start_t0 = now
+            # Decorative Daleks only: roam and hum, never aim or fire.
+            for d in self.daleks:
+                if d.state in ("aim", "fire"):
+                    d.state = "roam"
+            self._update_daleks(now, dt)
+            self._update_hum(now, dt)
+            return
         if self.card_t0 is not None:
             t = now - self.card_t0
             if not self.card_switched and t >= CARD_FADE_MS:
@@ -1876,36 +2015,35 @@ class Game:
         return tiles
 
     def draw(self, window: pygame.Surface, now: float):
-        """Everything is drawn into self.frame, an opaque back buffer made
-        like the world surface, and copied to the window in one opaque blit.
-
-        Nothing with per-pixel alpha is ever blitted straight onto the window
-        surface: on some systems that surface has an alpha channel which ends
-        up 0, and pygame then copies source pixels verbatim instead of
-        blending them (transparent parts of glows, text and the laser showed
-        as black or coloured boxes)."""
+        """World, effects and HUD are all drawn on the low-res view, then
+        nearest-neighbour scaled into an opaque back buffer and copied to the
+        window. Text and overlays look as chunky as the maze; nothing with
+        per-pixel alpha is blitted straight onto the window surface."""
         if self.frame is None or self.frame.get_size() != window.get_size():
             self.frame = pygame.Surface(window.get_size()).convert()
-        screen = self.frame
         view = self.view
         self._draw_world(view, now)
-        if view.get_size() == screen.get_size():
-            screen.blit(view, (0, 0))
-        elif ZOOM_SMOOTH:
-            pygame.transform.smoothscale(view, screen.get_size(), screen)
+        if self.mode == "title":
+            self._draw_title(view, now)
         else:
-            pygame.transform.scale(view, screen.get_size(), screen)
-        # Effects and HUD at full window resolution, on top of the scaled world.
-        self._draw_effects(screen, now)
-        self._draw_minimap(screen)
-        self._draw_hint(screen)
-        self._draw_disguise_hud(screen, now)
-        self._draw_level_hud(screen)
-        if self.dead and now - self.death_t0 >= DEATH_MSG_MS:
-            self._draw_panel(screen, "EXTERMINATED!", f"You reached level {self.level}.  Press Enter to start again", (255, 96, 72))
-        self._draw_banners(screen, now)
-        self._draw_card(screen, now)
-        window.blit(screen, (0, 0))
+            self._draw_effects(view, now)
+            self._draw_minimap(view)
+            self._draw_cloak_hud(view, now)
+            self._draw_level_hud(view)
+            if self.dead and now - self.death_t0 >= DEATH_MSG_MS:
+                who = self.char_name
+                self._draw_panel(
+                    view, "EXTERMINATED!",
+                    f"{who} reached level {self.level}.  Enter for title",
+                    (255, 96, 72),
+                )
+            self._draw_banners(view, now)
+            self._draw_card(view, now)
+        if ZOOM_SMOOTH:
+            pygame.transform.smoothscale(view, self.frame.get_size(), self.frame)
+        else:
+            pygame.transform.scale(view, self.frame.get_size(), self.frame)
+        window.blit(self.frame, (0, 0))
 
     def _draw_world(self, screen: pygame.Surface, now: float):
         screen.fill(BG_COLOUR)
@@ -1936,12 +2074,14 @@ class Game:
         entities = []
         # Walking into the exit TARDIS he keeps his normal depth: the box (same
         # depth, drawn after him) and the hedges in front hide him as he goes in.
-        entities.append((char_depth, 1, lambda: self._draw_archie(screen, feet_sx, feet_sy, now)))
+        # On the title screen the player is not in the maze.
+        if self.mode == "play":
+            entities.append((char_depth, 1, lambda: self._draw_archie(screen, feet_sx, feet_sy, now)))
         for d in self.daleks:
             entities.append((d.pos[0] + d.pos[1], 0, lambda d=d: self._draw_dalek(screen, d, now, cam_x, cam_y)))
         ec, er = self.exit_cell
         entities.append((float(ec + er), 2, lambda: self._draw_tardis(screen, cam_x, cam_y, now)))
-        if self.demat_t0 is None or now - self.demat_t0 < self.demat_len:
+        if self.mode == "play" and (self.demat_t0 is None or now - self.demat_t0 < self.demat_len):
             dc, dr = self.demat_cell
             # On its own cell, (1, 1), one behind Archie's start cell.
             entities.append((float(dc + dr), 0.5, lambda: self._draw_demat(screen, now, cam_x, cam_y)))
@@ -2186,30 +2326,26 @@ class Game:
         # Ground-diamond centre of the hedge sprite sits on Archie's feet.
         screen.blit(img, (int(round(fx - HEDGE_OX * k)), int(round(fy - (HEDGE_OY + TILE_H // 2) * k))))
 
-    def _to_window(self, x: float, y: float):
-        return x * WIN_W / self.view_w, y * WIN_H / self.view_h
-
     def _draw_effects(self, screen, now: float):
-        """Telegraph glow, shout, laser and flash, drawn at window resolution."""
+        """Telegraph glow, shout and laser, drawn on the low-res view."""
         for d in self.daleks:
             if d.state == "aim":
                 u = max(0.0, min(1.0, (now - d.aim_t0) / max(1.0, d.fire_at - d.aim_t0)))
-                ex, ey = self._to_window(*self._dalek_point(d, now, self.dalek_eye))
+                ex, ey = self._dalek_point(d, now, self.dalek_eye)
                 flick = 0.75 + 0.25 * math.sin(now * 0.06)
-                self._solid_glow(screen, ex, ey, (3.0 + 6.0 * u) * flick, EYE_GLOW)
+                self._solid_glow(screen, ex, ey, (2.0 + 4.0 * u) * flick, EYE_GLOW)
             if d.state == "aim" or (d.state == "fire" and now - d.fire_t0 < LASER_MS + 400):
                 self._draw_shout(screen, d, now)
         if self.dead and self.shooter is not None:
             t = now - self.death_t0
             if t < LASER_MS:
-                gx, gy = self._to_window(*self._dalek_point(self.shooter, now, self.dalek_gun))
+                gx, gy = self._dalek_point(self.shooter, now, self.dalek_gun)
                 fx, fy = self.archie_feet
-                tx, ty = self._to_window(fx, fy - 34)
-                self._draw_laser(screen, (gx, gy), (tx, ty), now, t)
+                self._draw_laser(screen, (gx, gy), (fx, fy - 34), now, t)
 
     def _draw_shout(self, screen, d: Dalek, now: float):
         fx, fy = d.feet
-        x, y = self._to_window(fx, fy - DALEK_H - 6)
+        x, y = fx, fy - DALEK_H - 6
         jig = int(math.sin(now * 0.05) * 1.5)
         text = "EXTERMINATE!"
         fg = self.font_shout.render(text, True, (255, 236, 120))
@@ -2244,53 +2380,56 @@ class Game:
             w = int(round(width * j * fade))
             if w >= 1:
                 pygame.draw.line(screen, colour, a, b, w)
-        self._solid_glow(screen, a[0], a[1], 6.0 * j * fade, LASER_TIP_GLOW)
-        self._solid_glow(screen, b[0], b[1], 8.0 * rng.uniform(0.8, 1.15) * fade, LASER_HIT_GLOW)
+        self._solid_glow(screen, a[0], a[1], 4.0 * j * fade, LASER_TIP_GLOW)
+        self._solid_glow(screen, b[0], b[1], 5.0 * rng.uniform(0.8, 1.15) * fade, LASER_HIT_GLOW)
 
-    def _draw_disguise_hud(self, screen, now: float):
+    def _draw_cloak_hud(self, screen, now: float):
+        """Chameleon Cloak device with charge meter (bottom-right of the view)."""
         if self.disguised:
             left = max(0.0, DISGUISE_MS - (now - self.disguise_t0))
-            label = f"Hiding as a hedge  {left / 1000:.1f} s   (H to stop)"
             frac = left / DISGUISE_MS
             bar = (96, 196, 84)
+            status = "active"
         elif now < self.cooldown_until:
             left = self.cooldown_until - now
-            label = f"Hedge disguise recharging  {left / 1000:.1f} s"
             frac = 1.0 - left / DISGUISE_COOLDOWN_MS
             bar = (150, 128, 84)
+            status = "recharge"
         else:
-            label = "Hedge disguise ready  (H)"
             frac = 1.0
             bar = (96, 196, 84)
-        text = self.font_hud.render(label, True, (240, 234, 214))
-        pad_x, pad_y = 12, 8
-        bw = max(text.get_width(), 220)
-        box = _new_rgba((bw + pad_x * 2, text.get_height() + pad_y * 2 + 10))
-        box.fill((36, 24, 16, 190))
-        pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
-        box.blit(text, (pad_x, pad_y))
-        by = pad_y + text.get_height() + 4
-        pygame.draw.rect(box, (20, 14, 10, 230), (pad_x, by, bw, 6))
-        pygame.draw.rect(box, bar, (pad_x, by, int(bw * max(0.0, min(1.0, frac))), 6))
+            status = "ready"
+        icon = self.cloak_icon
+        label = self.font_hud.render("Chameleon Cloak", True, (240, 234, 214))
+        pad = 6
+        bw = max(icon.get_width() + 10, label.get_width() + 8, 70)
+        bh = icon.get_height() + label.get_height() + 18
+        box = _new_rgba((bw + pad * 2, bh + pad * 2))
+        box.fill((36, 24, 16, 200))
+        pygame.draw.rect(box, (186, 160, 96, 220), box.get_rect(), 1)
+        ix = pad + (bw - icon.get_width()) // 2
+        box.blit(icon, (ix, pad))
+        # Charge meter under the badge
+        mx, my, mw, mh = pad + 4, pad + icon.get_height() + 2, bw - 8, 5
+        pygame.draw.rect(box, (20, 14, 10, 230), (mx, my, mw, mh))
+        pygame.draw.rect(box, bar, (mx, my, int(mw * max(0.0, min(1.0, frac))), mh))
+        if status == "ready" and int(now / 400) % 2 == 0:
+            pygame.draw.rect(box, (220, 255, 180, 180), (mx, my, mw, mh), 1)
+        box.blit(label, (pad + (bw - label.get_width()) // 2, my + mh + 3))
         box = _finish_rgba(box)
-        screen.blit(box, (WIN_W - box.get_width() - 14, WIN_H - box.get_height() - 14))
+        screen.blit(box, (self.view_w - box.get_width() - 8, self.view_h - box.get_height() - 8))
 
     def _draw_minimap(self, screen):
+        # scale 3 on the low-res view → twice the old on-screen size after 2x zoom.
         scale = 3
-        pad = 6
+        pad = 4
         size = MAZE_SIZE * scale
         box = _new_rgba((size + pad * 2, size + pad * 2))
         box.fill((36, 24, 16, 200))
         pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
         for row in range(MAZE_SIZE):
             for col in range(MAZE_SIZE):
-                cell = self.grid[row][col]
-                if cell == WALL:
-                    colour = (28, 72, 36)
-                elif cell == EXIT:
-                    colour = (142, 98, 56)
-                else:
-                    colour = (142, 98, 56)
+                colour = (28, 72, 36) if self.grid[row][col] == WALL else (142, 98, 56)
                 box.fill(colour, (pad + col * scale, pad + row * scale, scale, scale))
         ec, er = self.exit_cell
         pygame.draw.circle(box, (70, 130, 255), (pad + ec * scale + 1, pad + er * scale + 1), 3)
@@ -2300,41 +2439,26 @@ class Game:
         px = pad + int(self.col * scale)
         py = pad + int(self.row * scale)
         pygame.draw.rect(box, (255, 248, 230), (px, py, scale, scale))
-        x = WIN_W - box.get_width() - 14
         box = _finish_rgba(box)
-        screen.blit(box, (x, 14))
-
-    def _draw_hint(self, screen):
-        mute = "M to unmute" if self.sfx.muted else "M to mute"
-        text = self.font_hint.render(
-            f"Left and right to turn. Up to step forward. H to hide as a hedge. {mute}", True, (240, 234, 214)
-        )
-        pad_x, pad_y = 12, 8
-        box = _new_rgba((text.get_width() + pad_x * 2, text.get_height() + pad_y * 2))
-        box.fill((36, 24, 16, 180))
-        pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
-        x, y = 14, WIN_H - box.get_height() - 14
-        box = _finish_rgba(box)
-        screen.blit(box, (x, y))
-        screen.blit(text, (x + pad_x, y + pad_y))
+        screen.blit(box, (self.view_w - box.get_width() - 8, 8))
 
     def _draw_level_hud(self, screen):
         text = self.font_hud.render(f"Level {self.level}    Daleks: {len(self.daleks)}", True, (240, 234, 214))
-        pad_x, pad_y = 12, 7
+        pad_x, pad_y = 8, 5
         box = _new_rgba((text.get_width() + pad_x * 2, text.get_height() + pad_y * 2))
         box.fill((36, 24, 16, 180))
         pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
         box = _finish_rgba(box)
-        screen.blit(box, (14, 14))
-        screen.blit(text, (14 + pad_x, 14 + pad_y))
+        screen.blit(box, (8, 8))
+        screen.blit(text, (8 + pad_x, 8 + pad_y))
 
     def _banner(self, screen, text: str, colour, fade: float, y: int):
         if fade <= 0.02:
             return
         surf = self.font_big.render(text, True, colour)
         shadow = self.font_big.render(text, True, (20, 12, 6))
-        x = (WIN_W - surf.get_width()) // 2
-        screen.blit(_alpha_scaled(shadow, fade * 0.8), (x + 2, y + 2))
+        x = (self.view_w - surf.get_width()) // 2
+        screen.blit(_alpha_scaled(shadow, fade * 0.8), (x + 1, y + 1))
         screen.blit(_alpha_scaled(surf, fade), (x, y))
 
     def _draw_banners(self, screen, now: float):
@@ -2343,7 +2467,7 @@ class Game:
             t = now - self.start_t0
             if t < LEVEL_BANNER_MS:
                 fade = min(1.0, t / 300.0, (LEVEL_BANNER_MS - t) / 600.0)
-                self._banner(screen, f"Level {self.level}", (255, 236, 170), fade, 90)
+                self._banner(screen, f"Level {self.level}", (255, 236, 170), fade, 40)
         # "Level complete!" while the TARDIS dematerialises with Archie inside.
         if self.exit_demat_t0 is not None and self.card_t0 is None:
             t = now - self.exit_demat_t0
@@ -2352,7 +2476,7 @@ class Game:
             level = int(round(fade * (len(self.complete_fades) - 1)))
             if level > 0:
                 img = self.complete_fades[level]
-                screen.blit(img, ((WIN_W - img.get_width()) // 2, int(WIN_H * COMPLETE_Y)))
+                screen.blit(img, ((self.view_w - img.get_width()) // 2, int(self.view_h * COMPLETE_Y)))
 
     def _draw_card(self, screen, now: float):
         """Fade to black, "Level N", fade into the new maze."""
@@ -2373,10 +2497,10 @@ class Game:
         else:
             level = self.level + 1
             text_fade = a
-        self._banner(screen, f"Level {level}", (255, 236, 170), text_fade, WIN_H // 2 - 40)
+        self._banner(screen, f"Level {level}", (255, 236, 170), text_fade, self.view_h // 2 - 24)
         sub = self.font_small.render(f"{daleks_for_level(level)} Daleks", True, (232, 214, 170))
         if text_fade > 0.02:
-            screen.blit(_alpha_scaled(sub, text_fade), ((WIN_W - sub.get_width()) // 2, WIN_H // 2 + 10))
+            screen.blit(_alpha_scaled(sub, text_fade), ((self.view_w - sub.get_width()) // 2, self.view_h // 2 + 4))
 
     def _draw_panel(self, screen, title_text: str, sub_text: str, title_colour):
         title = self.font_big.render(title_text, True, title_colour)
@@ -2390,16 +2514,73 @@ class Game:
         panel.blit(title, ((width - title.get_width()) // 2, 16))
         panel.blit(sub, ((width - sub.get_width()) // 2, 16 + title.get_height() + gap))
         panel = _finish_rgba(panel)
-        screen.blit(panel, ((WIN_W - width) // 2, (WIN_H - height) // 2))
+        screen.blit(panel, ((self.view_w - width) // 2, (self.view_h - height) // 2))
 
+
+    def _draw_title(self, screen, now: float):
+        """Title overlay on the live decorative maze: name, portraits, help."""
+        # Soft dark veil so the text is readable over the scrolling maze.
+        veil = _new_rgba((self.view_w, self.view_h))
+        veil.fill((10, 6, 4, 110))
+        screen.blit(_finish_rgba(veil), (0, 0))
+        title = self.font_title.render("Daleks in Hedges", True, (255, 236, 170))
+        shadow = self.font_title.render("Daleks in Hedges", True, (20, 12, 6))
+        tx = (self.view_w - title.get_width()) // 2
+        screen.blit(shadow, (tx + 1, 11))
+        screen.blit(title, (tx, 10))
+        sub = self.font_small.render("Choose Archie or Holly", True, (220, 200, 160))
+        screen.blit(sub, ((self.view_w - sub.get_width()) // 2, 10 + title.get_height() + 4))
+
+        # Portraits
+        gap = 40
+        portraits = []
+        for i, cid in enumerate(CHAR_ORDER):
+            portraits.append((cid, self.char_sets[cid]))
+        total_w = sum(cs["portrait"].get_width() for _, cs in portraits) + gap
+        x0 = (self.view_w - total_w) // 2
+        y0 = self.view_h // 2 - 70
+        for i, (cid, cs) in enumerate(portraits):
+            img = cs["portrait"]
+            selected = i == self.title_pick
+            bx = x0 - 6
+            by = y0 - 6
+            bw, bh = img.get_width() + 12, img.get_height() + 28
+            frame = _new_rgba((bw, bh))
+            frame.fill((36, 24, 16, 210 if selected else 150))
+            border = (255, 220, 120, 255) if selected else (140, 110, 70, 180)
+            pygame.draw.rect(frame, border, frame.get_rect(), 2 if selected else 1)
+            frame = _finish_rgba(frame)
+            screen.blit(frame, (bx, by))
+            screen.blit(img, (x0, y0))
+            name = self.font_small.render(cs["name"], True, (255, 236, 170) if selected else (200, 180, 140))
+            screen.blit(name, (x0 + (img.get_width() - name.get_width()) // 2, y0 + img.get_height() + 4))
+            if selected:
+                mark = self.font_hud.render("SELECTED", True, (255, 220, 120))
+                screen.blit(mark, (x0 + (img.get_width() - mark.get_width()) // 2, by - 12))
+            x0 += img.get_width() + gap
+
+        mute = "M unmute" if self.sfx.muted else "M mute"
+        lines = [
+            "Left/Right or A/D (or 1/2): choose character",
+            "Enter / Space: start",
+            "In game: Left/Right turn, Up/Down step, H Chameleon Cloak, " + mute,
+        ]
+        y = self.view_h - 8 - 12 * len(lines)
+        for line in lines:
+            t = self.font_hint.render(line, True, (230, 214, 180))
+            screen.blit(t, ((self.view_w - t.get_width()) // 2, y))
+            y += 12
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="Archie's isometric hedge maze")
+    parser = argparse.ArgumentParser(description="Daleks in Hedges")
     parser.add_argument("--seed", type=int, default=None, help="maze seed (default: time)")
     parser.add_argument("--screenshot", type=str, default=None, help="save a frame to this path and quit")
     parser.add_argument("--frames", type=int, default=None, help="after the first frame, simulate N movement frames")
     parser.add_argument("--level", type=int, default=1, help="start on this level (3 + 2 per level Daleks)")
-    parser.add_argument("--scene", choices=("dalek", "laser", "telegraph", "disguise", "tardis", "tardis_demat", "tardis_exit"), default=None,
+    parser.add_argument("--character", choices=list(CHAR_ORDER), default="archie",
+                        help="playable character (skipped on the title screen)")
+    parser.add_argument("--no-title", action="store_true", help="skip the title screen and start playing")
+    parser.add_argument("--scene", choices=("dalek", "laser", "telegraph", "disguise", "tardis", "tardis_demat", "tardis_exit", "title"), default=None,
                         help="debug: arrange a scene, simulate it briefly, then screenshot")
     parser.add_argument("--scene-ms", type=float, default=None, help="debug: override the scene's simulated time")
     return parser.parse_args(argv)
@@ -2412,9 +2593,16 @@ def main(argv=None):
     except Exception:
         pass
     pygame.init()
-    pygame.display.set_caption("Archie's Hedge Maze")
+    pygame.display.set_caption("Daleks in Hedges")
     screen = pygame.display.set_mode((WIN_W, WIN_H))
-    game = Game(args.seed, args.level)
+    skip_title = args.no_title or args.scene is not None or args.frames is not None or args.screenshot is not None
+    if args.scene == "title":
+        skip_title = False
+    game = Game(args.seed, args.level, character=args.character, title=not skip_title)
+    if args.scene == "title":
+        game.mode = "title"
+        if args.character in CHAR_ORDER:
+            game.title_pick = CHAR_ORDER.index(args.character)
     headless = args.screenshot is not None or args.frames is not None or args.scene is not None
 
     if not headless:

@@ -1,6 +1,8 @@
-# Archie Maze
+# Daleks in Hedges
 
-An isometric hedge maze. Archie stays in the middle of the screen and the maze stays flat. Daleks roam the hedges; reach the TARDIS in the far corner to escape to the next level, where there is a new maze and more Daleks.
+An isometric hedge maze. Archie or Holly stays in the middle of the screen and the maze stays flat. Daleks roam the hedges; reach the TARDIS in the far corner to escape to the next level, where there is a new maze and more Daleks.
+
+The game opens on a **title screen** with a live decorative maze (ten Daleks roaming, no deaths) and a character select: Archie or Holly. After you are exterminated you return to the title screen to pick again.
 
 ## Play
 
@@ -14,12 +16,20 @@ python3 game.py
 | Left / A, Right / D | Turn Archie |
 | Up / W | Step forward |
 | Down / S | Step back |
-| H (or Shift) | Hide as a hedge for up to 4 s (press again to stop early); 3 s to recharge |
+| H (or Shift) | **Chameleon Cloak**: hide as a hedge for up to 4 s (press again to stop early); 3 s to recharge |
 | M | Mute / unmute the sound |
-| Enter, R or Space | After you are exterminated: start again from level 1 in a new maze |
+| Enter, R or Space | On the title screen: start. After you are exterminated: return to the title screen |
 | Esc | Quit |
 
 A Dalek sees Archie only along the corridor it is facing, up to 8 cells away with no hedge in between. It shouts, its eye stalk glows, and a moment later it fires. Daleks cannot see a hedge, and they turn away if one is in their path.
+
+## Title screen
+
+A live maze scrolls behind the menu with ten Daleks roaming for atmosphere (they cannot kill you there). Choose **Archie** or **Holly** with Left/Right, A/D, or 1/2, then Enter or Space to start. Controls are listed on the title screen.
+
+## Chameleon Cloak
+
+Press **H** (or Shift) to become a hedge for up to 4 seconds. Daleks cannot see you while you are cloaked. A device graphic in the bottom-right corner shows the charge (ready / depleting / recharging). Peeking eyes still show so you can find yourself.
 
 You can hear a Dalek coming: it hums as it glides, faintly from about 25 cells away and louder the closer it is. Only the straight-line distance counts, so you hear Daleks behind hedges and on other paths too. The hum stops briefly while a Dalek turns or stands still. Four sound channels carry the four loudest Daleks; when several hum at once, they are all turned down a little so the total stays comfortable.
 
@@ -39,13 +49,14 @@ The maze stays 41 × 41. Daleks start at least 12 cells (along the paths) from A
 
 When Archie steps onto the TARDIS, the controls lock and the Daleks freeze (their hum fades). Archie walks on from his corridor into the box and fades away inside it. The TARDIS then dematerialises with the same animation and sound as at the start, with "Level complete!" on screen. Then a short "Level N" card is shown, and the next level begins in a brand-new maze. The current level and the number of Daleks are shown in the top-left corner.
 
-If a Dalek exterminates Archie, the message shows the level you reached. Press Enter, R or Space to start again from level 1 in a new maze.
+If a Dalek exterminates you, the message shows the character and the level you reached. Press Enter, R or Space to return to the title screen and choose again.
 
 Each level starts with the TARDIS that dropped Archie off standing on the corner cell, with Archie one cell in front of it, facing into the maze. You cannot walk back into it while it is there. After 5 seconds it dematerialises, fading in and out for as long as the TARDIS sound lasts (about 6.6 s with the supplied clip). You can start walking straight away.
 
 ```bash
-python3 game.py --seed 1      # a fixed first maze
-python3 game.py --level 4     # start on level 4 (9 Daleks)
+python3 game.py --seed 1                 # fixed maze (after the title screen)
+python3 game.py --no-title --character holly
+python3 game.py --level 4 --no-title     # start on level 4 (9 Daleks)
 ```
 
 ## Sound
@@ -75,15 +86,15 @@ Drop your own TARDIS sound as `assets/sounds/tardis_real.wav` (or `.ogg`/`.mp3`)
 
 If the computer has no working audio, or a sound file is missing, the game still runs, just silently.
 
-## Effects
+## Effects and HUD
 
-The Dalek laser and the eye, gun-tip and hit glows are drawn with plain solid-colour lines and circles. The TARDIS roof-lamp glow is a small PNG in `assets/fx/`, made by:
+The world, HUD text, laser and overlays are all drawn on the low-resolution view and nearest-neighbour scaled up, so UI looks as chunky as the maze. The Dalek laser and glows use solid-colour lines and circles. The TARDIS roof-lamp glow and the Chameleon Cloak badge are PNGs in `assets/fx/`, made by:
 
 ```bash
 python3 tools/make_fx.py
 ```
 
-Each frame is drawn into an opaque back buffer and copied to the window in one go, so the effects look the same on every system.
+Each frame is drawn into an opaque back buffer and copied to the window in one go.
 
 ## Testing without a screen
 
@@ -92,7 +103,7 @@ SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --screenshot shot.png --frames 20
 SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --scene laser --screenshot laser.png
 ```
 
-Scenes: `dalek`, `laser`, `telegraph`, `disguise`, `tardis`, `tardis_demat`, `tardis_exit`. Add `--scene-ms N` to choose how far into the scene the shot is taken, for example `--scene tardis_demat --scene-ms 6500` (the TARDIS waits 5 s, so that is 1.5 s into the dematerialisation).
+Scenes: `dalek`, `laser`, `telegraph`, `disguise`, `tardis`, `tardis_demat`, `tardis_exit`, `title`. Add `--scene-ms N` to choose how far into the scene the shot is taken, for example `--scene tardis_demat --scene-ms 6500` (the TARDIS waits 5 s, so that is 1.5 s into the dematerialisation).
 
 `tardis_exit` puts Archie next to the TARDIS and steps him in. Use `--scene-ms` to follow the whole exit sequence. With a 6.6 s TARDIS sound: Archie walks in and fades out over 0 to 0.5 s, the dematerialisation runs from 0.9 s to about 7.5 s, the "Level 2" card from about 7.8 to 9.7 s, and level 2 starts after that.
 
