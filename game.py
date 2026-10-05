@@ -179,6 +179,8 @@ RUSTLE_GAP_MS = 450          # the soft rustle at most about twice a second
 # never steal it. Loud only when a Dalek is gliding close by; it fades out
 # while the Dalek turns or stands still (aiming, firing, blocked).
 HUM_FILE = "dalek_hum.wav"
+TITLE_THEME_FILE = "title_theme.wav"
+TITLE_THEME_VOLUME = 0.55
 HUM_CHANNELS = 4             # reserved hum channels, given to the loudest Daleks
 HUM_MAX = 0.5                # channel volume when a Dalek is right next to Archie
 HUM_FAR = 25.0               # silent at this effective distance (cells) ...
@@ -831,6 +833,17 @@ class Sounds:
             self.hum = pygame.mixer.Sound(os.path.join(SOUND_DIR, HUM_FILE))
         except Exception:
             self.hum = None
+        self.title_theme = None
+        self.title_channel = None
+        self.want_title = False
+        try:
+            self.title_theme = pygame.mixer.Sound(os.path.join(SOUND_DIR, TITLE_THEME_FILE))
+            self.title_theme.set_volume(TITLE_THEME_VOLUME)
+            # Channel after the reserved hum ones, so effects and theme never clash.
+            self.title_channel = pygame.mixer.Channel(HUM_CHANNELS)
+        except Exception:
+            self.title_theme = None
+            self.title_channel = None
         for name, filename in SOUND_FILES.items():
             try:
                 snd = pygame.mixer.Sound(os.path.join(SOUND_DIR, filename))
@@ -920,10 +933,34 @@ class Sounds:
         except Exception:
             pass
 
+    def start_title_theme(self):
+        """Loop the title theme; silent if muted or the file is missing."""
+        self.want_title = True
+        self.stop_hums()
+        if self.muted or not self.ok or self.title_theme is None or self.title_channel is None:
+            return
+        try:
+            if not self.title_channel.get_busy():
+                self.title_channel.play(self.title_theme, loops=-1)
+            self.title_channel.set_volume(TITLE_THEME_VOLUME)
+        except Exception:
+            pass
+
+    def stop_title_theme(self):
+        self.want_title = False
+        if self.title_channel is None:
+            return
+        try:
+            self.title_channel.stop()
+        except Exception:
+            pass
+
     def toggle_mute(self):
         self.muted = not self.muted
         if self.muted:
             self.stop_all()
+        elif self.want_title:
+            self.start_title_theme()
 
 
 class Dalek:
@@ -976,7 +1013,8 @@ def _load_char_sprites(files: dict):
         h = image.get_height()
         if h != SPRITE_H:
             w = max(1, round(image.get_width() * SPRITE_H / h))
-            image = _finish_rgba(pygame.transform.smoothscale(image, (w, SPRITE_H)))
+            # Nearest-neighbour keeps white dress pixels solid (smoothscale muddy them).
+            image = _finish_rgba(pygame.transform.scale(image, (w, SPRITE_H)))
         sprites[key] = image
         anchors[key] = _feet_anchor(image)
     white = {key: _faded_silhouettes(image, DEATH_FADE_LEVELS) for key, image in sprites.items()}
@@ -1001,12 +1039,8 @@ class Game:
         self.char_sets = {}
         for cid, info in CHARACTERS.items():
             sprites, anchors, white = _load_char_sprites(info["files"])
-            # Large SE portrait for the title screen (smoothscale once; then drawn
-            # on the low-res view so the 2x nearest scale makes it chunky).
-            se = sprites["se"]
-            ph = 110
-            pw = max(1, round(se.get_width() * ph / se.get_height()))
-            portrait = _finish_rgba(pygame.transform.smoothscale(se, (pw, ph)))
+            # Title portrait = same size as in-game (SPRITE_H), not enlarged.
+            portrait = sprites["se"]
             self.char_sets[cid] = {
                 "name": info["name"], "sprites": sprites, "anchors": anchors,
                 "white": white, "portrait": portrait,
@@ -1072,7 +1106,10 @@ class Game:
         self.view = pygame.Surface((self.view_w, self.view_h)).convert()
         self.frame = None  # opaque window-sized back buffer, made on the first draw
         # Fonts sized for the low-res view; they look chunky after nearest 2x.
-        self.font_title = load_font(22, bold=True)
+        self.font_title = load_font(28, bold=True)   # title screen name
+        self.font_title_sub = load_font(14)            # "Choose Archie or Holly"
+        self.font_title_help = load_font(11)           # controls help on title
+        self.font_title_sel = load_font(11, bold=True) # SELECTED
         self.font_big = load_font(18, bold=True)
         self.font_small = load_font(10)
         self.font_shout = load_font(8, bold=True)
@@ -1164,9 +1201,11 @@ class Game:
         # Title Daleks never aim/fire: keep them roaming forever.
         for d in self.daleks:
             d.state = "roam"
+        self.sfx.start_title_theme()
 
     def _start_game(self, now: float):
         """Leave the title screen and begin level 1 with the selected character."""
+        self.sfx.stop_title_theme()
         self._apply_character(CHAR_ORDER[self.title_pick])
         self.mode = "play"
         self.level = 1
@@ -1751,12 +1790,13 @@ class Game:
         if self.mode == "title":
             if self.start_t0 is None:
                 self.start_t0 = now
-            # Decorative Daleks only: roam and hum, never aim or fire.
+            # Decorative Daleks only: roam, never aim/fire, and never hum
+            # (the title theme plays instead).
             for d in self.daleks:
                 if d.state in ("aim", "fire"):
                     d.state = "roam"
             self._update_daleks(now, dt)
-            self._update_hum(now, dt)
+            self.sfx.stop_hums()
             return
         if self.card_t0 is not None:
             t = now - self.card_t0
@@ -2033,9 +2073,10 @@ class Game:
             if self.dead and now - self.death_t0 >= DEATH_MSG_MS:
                 who = self.char_name
                 self._draw_panel(
-                    view, "EXTERMINATED!",
-                    f"{who} reached level {self.level}.  Enter for title",
+                    view, "EXTERMINATED",
+                    f"{who} reached level {self.level}",
                     (255, 96, 72),
+                    foot="Enter to Play Again",
                 )
             self._draw_banners(view, now)
             self._draw_card(view, now)
@@ -2502,17 +2543,26 @@ class Game:
         if text_fade > 0.02:
             screen.blit(_alpha_scaled(sub, text_fade), ((self.view_w - sub.get_width()) // 2, self.view_h // 2 + 4))
 
-    def _draw_panel(self, screen, title_text: str, sub_text: str, title_colour):
+    def _draw_panel(self, screen, title_text: str, sub_text: str, title_colour, foot: str | None = None):
+        """Death / message panel. No full stops on any line."""
+        title_text = title_text.replace(".", "")
+        sub_text = sub_text.replace(".", "")
+        if foot:
+            foot = foot.replace(".", "")
         title = self.font_big.render(title_text, True, title_colour)
         sub = self.font_small.render(sub_text, True, (232, 214, 170))
-        gap = 10
-        width = max(title.get_width(), sub.get_width()) + 56
-        height = title.get_height() + sub.get_height() + gap + 36
+        foot_s = self.font_small.render(foot, True, (232, 214, 170)) if foot else None
+        gap = 8
+        lines = [title, sub] + ([foot_s] if foot_s else [])
+        width = max(t.get_width() for t in lines) + 40
+        height = sum(t.get_height() for t in lines) + gap * (len(lines) - 1) + 28
         panel = _new_rgba((width, height))
         panel.fill((36, 24, 16, 255))
         pygame.draw.rect(panel, (212, 170, 90), panel.get_rect(), 2)
-        panel.blit(title, ((width - title.get_width()) // 2, 16))
-        panel.blit(sub, ((width - sub.get_width()) // 2, 16 + title.get_height() + gap))
+        y = 14
+        for t in lines:
+            panel.blit(t, ((width - t.get_width()) // 2, y))
+            y += t.get_height() + gap
         panel = _finish_rgba(panel)
         screen.blit(panel, ((self.view_w - width) // 2, (self.view_h - height) // 2))
 
@@ -2526,19 +2576,19 @@ class Game:
         title = self.font_title.render("Daleks in Hedges", True, (255, 236, 170))
         shadow = self.font_title.render("Daleks in Hedges", True, (20, 12, 6))
         tx = (self.view_w - title.get_width()) // 2
-        screen.blit(shadow, (tx + 1, 11))
-        screen.blit(title, (tx, 10))
-        sub = self.font_small.render("Choose Archie or Holly", True, (220, 200, 160))
-        screen.blit(sub, ((self.view_w - sub.get_width()) // 2, 10 + title.get_height() + 4))
+        screen.blit(shadow, (tx + 1, 8))
+        screen.blit(title, (tx, 7))
+        sub = self.font_title_sub.render("Choose Archie or Holly", True, (220, 200, 160))
+        screen.blit(sub, ((self.view_w - sub.get_width()) // 2, 7 + title.get_height() + 4))
 
         # Portraits
-        gap = 40
+        gap = 28
         portraits = []
         for i, cid in enumerate(CHAR_ORDER):
             portraits.append((cid, self.char_sets[cid]))
         total_w = sum(cs["portrait"].get_width() for _, cs in portraits) + gap
         x0 = (self.view_w - total_w) // 2
-        y0 = self.view_h // 2 - 70
+        y0 = self.view_h // 2 - 50
         for i, (cid, cs) in enumerate(portraits):
             img = cs["portrait"]
             selected = i == self.title_pick
@@ -2552,11 +2602,11 @@ class Game:
             frame = _finish_rgba(frame)
             screen.blit(frame, (bx, by))
             screen.blit(img, (x0, y0))
-            name = self.font_small.render(cs["name"], True, (255, 236, 170) if selected else (200, 180, 140))
+            name = self.font_title_sub.render(cs["name"], True, (255, 236, 170) if selected else (200, 180, 140))
             screen.blit(name, (x0 + (img.get_width() - name.get_width()) // 2, y0 + img.get_height() + 4))
             if selected:
-                mark = self.font_hud.render("SELECTED", True, (255, 220, 120))
-                screen.blit(mark, (x0 + (img.get_width() - mark.get_width()) // 2, by - 12))
+                mark = self.font_title_sel.render("SELECTED", True, (255, 220, 120))
+                screen.blit(mark, (x0 + (img.get_width() - mark.get_width()) // 2, by - 14))
             x0 += img.get_width() + gap
 
         mute = "M unmute" if self.sfx.muted else "M mute"
@@ -2565,11 +2615,11 @@ class Game:
             "Enter / Space: start",
             "In game: Left/Right turn, Up/Down step, H Chameleon Cloak, " + mute,
         ]
-        y = self.view_h - 8 - 12 * len(lines)
+        y = self.view_h - 10 - 14 * len(lines)
         for line in lines:
-            t = self.font_hint.render(line, True, (230, 214, 180))
+            t = self.font_title_help.render(line, True, (230, 214, 180))
             screen.blit(t, ((self.view_w - t.get_width()) // 2, y))
-            y += 12
+            y += 14
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Daleks in Hedges")

@@ -25,7 +25,7 @@ A Dalek sees Archie only along the corridor it is facing, up to 8 cells away wit
 
 ## Title screen
 
-A live maze scrolls behind the menu with ten Daleks roaming for atmosphere (they cannot kill you there). Choose **Archie** or **Holly** with Left/Right, A/D, or 1/2, then Enter or Space to start. Controls are listed on the title screen.
+A live maze scrolls behind the menu with ten Daleks roaming for atmosphere (they cannot kill you there). Choose **Archie** or **Holly** with Left/Right, A/D, or 1/2, then Enter or Space to start. An original electronic title theme loops here (M mutes it); Dalek hums are silent until you play. Controls are listed on the title screen.
 
 ## Chameleon Cloak
 
@@ -73,6 +73,7 @@ All sounds are small WAV files in `assets/sounds/` (22050 Hz, 16-bit mono):
 | `laser.wav` | The Dalek fires | Synthesised: a descending zap with buzz and crackle |
 | `step1.wav`, `step2.wav`, `step3.wav` | One soft footstep per half-tile hop, varied | Synthesised: a low thump plus a little gravel crunch |
 | `dalek_hum.wav` | Loops for each Dalek gliding within about 25 cells (straight line), faint far off and louder up close, panned a little left or right; it fades out while the Dalek turns or stands still. Four mixer channels carry the hums of the four loudest Daleks | Synthesised 2 s seamless loop: detuned saw and square oscillators (110, 111, 165 and 220.5 Hz) through a resonant filter sweeping 400 to 2500 Hz twice per loop, a 4 Hz throb, an FM shimmer and an electronic whoosh. Pitched so laptop speakers can play it |
+| `title_theme.wav` | Loops on the title screen (muted with M); stops when a game starts. Dalek hums stay silent on the title | Synthesised 12 s seamless loop: heavy 55 Hz bass throb, whooshy swept-noise pad, eerie minor lead motif, soft shimmer and drone. Original electronic track inspired by Doctor Who *vibes* only — not the BBC theme |
 | `tardis_demat.wav` | The TARDIS dematerialises, 5 s into each level, and again when Archie leaves in it | A supplied recording. `tools/make_sounds.py` can also synthesise an original wheeze-groan here (three rising-and-falling grinding groans with ring-modulated metallic overtones, reverb and a soft thud), but it keeps an existing file unless you pass `--overwrite-tardis` |
 
 To regenerate them (needs numpy; the two voices also need `espeak-ng`, for example `sudo apt install espeak-ng`):

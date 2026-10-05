@@ -6,7 +6,7 @@
 
 Needs numpy. The two voice sounds (ow, exterminate) also need espeak-ng on
 the PATH (offline TTS); the laser and footsteps are pure synthesis.
-Everything is 22050 Hz, 16-bit mono.
+Everything is 22050 Hz, 16-bit mono. title_theme is a longer seamless loop for the title screen.
 """
 
 from __future__ import annotations
@@ -299,6 +299,88 @@ def _circular_band(n, rng, fc, width_oct, tilt=0.0):
     return y / (np.sqrt(np.mean(y ** 2)) or 1.0)
 
 
+
+def make_title_theme() -> np.ndarray:
+    """Original ~12 s seamless electronic title loop: Doctor Who *vibes* only
+    (not the BBC theme). Heavy throbbing bass, whooshy swept synth, eerie
+    minor lead. Every oscillator, LFO and sweep has a whole number of cycles
+    in the loop so the end runs straight into the start. No clipping."""
+    rng = np.random.default_rng(42)
+    dur = 12.0
+    n = int(dur * SR)
+    t = np.arange(n) / SR
+
+    def lfo(cycles, phase=0.0):
+        return np.sin(2 * np.pi * cycles / dur * t + phase)
+
+    # --- heavy bass: detuned saws at 55 Hz (integer cycles: 55*12=660) ---
+    def partial_saw(f0, amp, n_partials=12):
+        y = np.zeros(n)
+        for k in range(1, n_partials + 1):
+            y += (amp / k) * np.sin(2 * np.pi * k * f0 * t + rng.uniform(0, 2 * np.pi))
+        return y
+
+    bass = partial_saw(55.0, 1.0) + 0.7 * partial_saw(55.5, 0.55) + 0.35 * partial_saw(110.0, 0.4)
+    # 2 Hz throb with a softer 1 Hz swell (24 and 12 cycles in 12 s)
+    bass *= (0.55 + 0.45 * (0.5 + 0.5 * lfo(24)) * (0.65 + 0.35 * lfo(12, 0.3)))
+    bass = onepole_lp(bass, 380.0)
+
+    # --- whooshy noise pad: band centre sweeps 400↔2200 Hz, 3 cycles ---
+    sweep = 0.5 + 0.5 * lfo(3, -np.pi / 2)
+    fc = 400.0 * (2200.0 / 400.0) ** sweep
+    whoosh = _swept_noise(n, rng, lambda tt: float(np.interp(tt, t, fc)), 0.55)
+    whoosh = onepole_hp(whoosh, 180.0) * (0.35 + 0.65 * sweep)
+
+    # --- eerie lead: minor motif (A3 E4 C4 G3 B3 E3 A3), soft square, portamento ---
+    # Notes as Hz; each held for 1.5 s → 8 notes = 12 s exactly.
+    motif = np.array([220.0, 329.63, 261.63, 196.0, 246.94, 164.81, 220.0, 174.61])
+    note_n = n // len(motif)
+    # smooth step between note frequencies (integer samples per note)
+    freq = np.zeros(n)
+    for i, f in enumerate(motif):
+        a, b = i * note_n, (i + 1) * note_n if i < len(motif) - 1 else n
+        # glide from previous into this note over first 0.12 s
+        prev = motif[i - 1] if i else motif[-1]
+        glide = int(0.12 * SR)
+        for j in range(a, b):
+            if j - a < glide:
+                u = (j - a) / glide
+                u = u * u * (3 - 2 * u)
+                freq[j] = prev + (f - prev) * u
+            else:
+                freq[j] = f
+    phase = np.cumsum(2 * np.pi * freq / SR)
+    # soft square via odd partials, amplitude gently pulsed
+    lead = np.zeros(n)
+    for k in (1, 3, 5, 7):
+        lead += (0.55 / k) * np.sin(k * phase + rng.uniform(0, 0.4))
+    lead *= (0.7 + 0.3 * lfo(8))
+    lead = onepole_lp(lead, 2400.0)
+
+    # --- high ghost shimmer (detuned, quiet) ---
+    shimmer = np.sin(2 * np.pi * 880.0 * t + 1.2 * np.sin(2 * np.pi * 110.0 * t))
+    shimmer *= (0.25 + 0.75 * (0.5 + 0.5 * lfo(6))) * 0.12
+
+    # --- low drone under everything ---
+    drone = 0.22 * np.sin(2 * np.pi * 55.0 * t) + 0.12 * np.sin(2 * np.pi * 82.5 * t)
+    drone *= (0.8 + 0.2 * lfo(4))
+
+    x = 0.95 * bass + 0.55 * whoosh + 0.42 * lead + shimmer + drone
+    # Soft edges already seamless by construction; normalise below clip
+    peak = np.max(np.abs(x)) + 1e-9
+    x = x / peak * 0.82
+    # Equal-power crossfade of the last/first 100 ms into a seamless join.
+    fade = int(0.10 * SR)
+    head, tail = x[:fade].copy(), x[-fade:].copy()
+    a = np.linspace(0, np.pi / 2, fade)
+    blended = tail * np.cos(a) + head * np.sin(a)
+    x[:fade] = blended
+    x[-fade:] = blended  # identical ends → wrap has zero discontinuity
+    x = np.clip(x / (np.max(np.abs(x)) + 1e-9) * 0.85, -0.95, 0.95)
+    return x
+
+
+
 def make_dalek_hum() -> np.ndarray:
     """A 2 s seamless loop: a throbbing electronic glide hum, pitched so that
     laptop and phone speakers (which drop everything below ~200 Hz) play it.
@@ -457,6 +539,7 @@ SOUNDS = {
     "cloak_on": lambda: make_cloak(True),
     "cloak_off": lambda: make_cloak(False),
     "dalek_hum": make_dalek_hum,
+    "title_theme": make_title_theme,
     "tardis_demat": make_tardis_demat,
 }
 
@@ -521,6 +604,9 @@ def main():
         if args.spectrograms and name in ("exterminate", "laser", "ow", "cloak_on", "cloak_off", "rustle", "tardis_demat"):
             os.makedirs(args.spectrograms, exist_ok=True)
             spectrogram_png(x, os.path.join(args.spectrograms, f"spec_{name}.png"), name)
+        if args.spectrograms and name == "title_theme":
+            spectrogram_png(np.concatenate([x, x[: SR]]), os.path.join(args.spectrograms, "spec_title_theme.png"),
+                            f"title_theme, {len(x)/SR:.1f}s loop (+1s of next)")
         if args.spectrograms and name == "dalek_hum":
             # The loop played twice, so the seam at 2.00 s can be checked by eye.
             os.makedirs(args.spectrograms, exist_ok=True)
