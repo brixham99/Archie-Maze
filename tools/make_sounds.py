@@ -3,8 +3,9 @@
 
     python3 tools/make_sounds.py                 # writes assets/sounds/*.wav
     python3 tools/make_sounds.py --spectrograms DIR
+    python3 tools/make_sounds.py --only dalek_destroy dalek_find_the_human   # just these
 
-Needs numpy. The two voice sounds (ow, exterminate) also need espeak-ng on
+Needs numpy. The voice sounds (ow, exterminate, dalek_*) also need espeak-ng on
 the PATH (offline TTS); the laser and footsteps are pure synthesis.
 Everything is 22050 Hz, 16-bit mono. title_theme is a longer seamless loop for the title screen.
 """
@@ -134,15 +135,14 @@ def espeak(text: str, voice: str, pitch: int, speed: int, amp: int = 160, extra=
 
 
 # ---------------------------------------------------------------- sounds
-def make_exterminate() -> np.ndarray:
-    """Staccato EX-TER-MIN-ATE!, ring-modulated at 30 Hz and roughened."""
-    parts = [
-        # (text, espeak pitch, speed, gap after in seconds)
-        ("[[Eks]]", 58, 175, 0.07),
-        ("[[t3:]]", 62, 175, 0.07),
-        ("[[mIn]]", 68, 175, 0.08),
-        ("[[eI:t]]", 86, 105, 0.0),
-    ]
+def dalek_voice(parts) -> np.ndarray:
+    """The shared Dalek voice chain: staccato syllables from espeak-ng,
+    ring-modulated at 30 Hz and roughened.
+
+    parts: (espeak phoneme text, pitch, speed, gap after in seconds) per
+    syllable. Daleks bark each syllable flat and then rise and stretch the
+    last one, so give the final syllable a higher pitch and slower speed.
+    """
     out = []
     for text, pitch, speed, gap in parts:
         syl = trim(espeak(text, "en-gb", pitch, speed, 180), 0.02)
@@ -166,6 +166,50 @@ def make_exterminate() -> np.ndarray:
     x = comb(x, 0.0065, 0.35, 0.35)
     x = trim(x, 0.004)
     return fade(normalise(x, 0.89), 0.002, 0.04)
+
+
+def make_exterminate() -> np.ndarray:
+    """Staccato EX-TER-MIN-ATE!, ring-modulated at 30 Hz and roughened."""
+    return dalek_voice([
+        # (text, espeak pitch, speed, gap after in seconds)
+        ("[[Eks]]", 58, 175, 0.07),
+        ("[[t3:]]", 62, 175, 0.07),
+        ("[[mIn]]", 68, 175, 0.08),
+        ("[[eI:t]]", 86, 105, 0.0),
+    ])
+
+
+# Ambient Dalek callouts, said now and then during play (the game picks one
+# at random and plays it as loud as the nearest Dalek's hum would be).
+# Same voice chain as Exterminate; Exterminate itself stays the "spotted you"
+# shout just before a Dalek fires.
+def make_dalek_human_detected() -> np.ndarray:
+    """HU-MAN DE-TEC-TED!"""
+    return dalek_voice([
+        ("[[hju:]]", 58, 175, 0.06),
+        ("[[m@n]]", 62, 175, 0.16),
+        ("[[dI]]", 60, 175, 0.05),
+        ("[[tEk]]", 66, 175, 0.06),
+        ("[[tId]]", 86, 105, 0.0),
+    ])
+
+
+def make_dalek_destroy() -> np.ndarray:
+    """DE-STROY!"""
+    return dalek_voice([
+        ("[[dI]]", 62, 175, 0.07),
+        ("[[strOI]]", 88, 100, 0.0),
+    ])
+
+
+def make_dalek_find_the_human() -> np.ndarray:
+    """FIND THE HU-MAN!"""
+    return dalek_voice([
+        ("[[faInd]]", 58, 175, 0.09),
+        ("[[D@]]", 60, 190, 0.06),
+        ("[[hju:]]", 66, 175, 0.06),
+        ("[[m@n]]", 86, 105, 0.0),
+    ])
 
 
 def make_laser() -> np.ndarray:
@@ -530,6 +574,9 @@ def make_tardis_demat() -> np.ndarray:
 
 SOUNDS = {
     "exterminate": make_exterminate,
+    "dalek_human_detected": make_dalek_human_detected,
+    "dalek_destroy": make_dalek_destroy,
+    "dalek_find_the_human": make_dalek_find_the_human,
     "laser": make_laser,
     "ow": make_ow,
     "step1": lambda: make_step(101, 1.0),
@@ -590,9 +637,13 @@ def main():
     ap.add_argument("--spectrograms", default=None, help="also write spectrogram PNGs here")
     ap.add_argument("--overwrite-tardis", action="store_true",
                     help="replace an existing tardis_demat.wav (it may be a real clip you supplied) with ours")
+    ap.add_argument("--only", nargs="+", metavar="NAME", choices=sorted(SOUNDS),
+                    help="only (re)make these sounds; the other WAVs are left as they are")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     for name, fn in SOUNDS.items():
+        if args.only and name not in args.only:
+            continue
         path = os.path.join(args.out, f"{name}.wav")
         if name == "tardis_demat" and os.path.exists(path) and not args.overwrite_tardis:
             print(f"{name:12s} kept the existing {os.path.relpath(path)} (use --overwrite-tardis to replace it)")
@@ -600,8 +651,8 @@ def main():
         x = fn()
         write_wav(path, x)
         rms = float(np.sqrt(np.mean(x ** 2)))
-        print(f"{name:12s} {len(x) / SR:5.2f} s  peak {np.max(np.abs(x)):.2f}  rms {rms:.3f}  -> {os.path.relpath(path)}")
-        if args.spectrograms and name in ("exterminate", "laser", "ow", "cloak_on", "cloak_off", "rustle", "tardis_demat"):
+        print(f"{name:20s} {len(x) / SR:5.2f} s  peak {np.max(np.abs(x)):.2f}  rms {rms:.3f}  -> {os.path.relpath(path)}")
+        if args.spectrograms and name in ("exterminate", "dalek_human_detected", "dalek_destroy", "dalek_find_the_human", "laser", "ow", "cloak_on", "cloak_off", "rustle", "tardis_demat"):
             os.makedirs(args.spectrograms, exist_ok=True)
             spectrogram_png(x, os.path.join(args.spectrograms, f"spec_{name}.png"), name)
         if args.spectrograms and name == "title_theme":

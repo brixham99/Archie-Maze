@@ -170,6 +170,22 @@ SOUND_VOLUME = {
     "tardis_demat": 0.6,
 }
 STEP_SOUNDS = ("step1", "step2", "step3")
+# Ambient Dalek callouts: now and then during play the nearest Dalek says one
+# of these, as loud as its hum would be (HUM_FAR/HUM_NEAR/HUM_CURVE, straight-
+# line distance), so a far-off Dalek is barely heard. "Exterminate!" is kept
+# for the moment a Dalek spots Archie, so it always means danger.
+TAUNT_FILES = {
+    "dalek_human_detected": "dalek_human_detected.wav",
+    "dalek_destroy": "dalek_destroy.wav",
+    "dalek_find_the_human": "dalek_find_the_human.wav",
+}
+SOUND_FILES.update(TAUNT_FILES)
+SOUND_VOLUME.update({name: 1.0 for name in TAUNT_FILES})  # loudness is set per play on the channel
+TAUNT_SOUNDS = tuple(TAUNT_FILES)
+TAUNT_MIN_MS = 30000         # a callout every 30 ..
+TAUNT_MAX_MS = 45000         # .. 45 s (random each time), counted from the level start
+TAUNT_MAX = 0.9              # channel volume with a Dalek right next to Archie (as loud as "Exterminate!")
+TAUNT_RETRY_MS = 2500        # due while another voice is speaking or a Dalek is aiming: try again shortly
 OW_BUMPS = 5                 # "ow" on the 5th hedge bump ...
 OW_WINDOW_MS = 2500          # ... within 2.5 s; single bumps only rustle
 OW_QUIET_MS = 3000           # after an "ow", bumps just rustle for a while
@@ -893,6 +909,25 @@ class Sounds:
         self.played[name] = self.played.get(name, 0) + 1
         return True
 
+    def play_voice(self, name: str, left: float, right: float):
+        """Play `name` once at this (left, right) channel volume; returns the
+        channel (or None) so the volume can follow a moving Dalek."""
+        self.requested[name] = self.requested.get(name, 0) + 1
+        if self.muted or not self.ok:
+            return None
+        snd = self.sounds.get(name)
+        if snd is None:
+            return None
+        try:
+            ch = snd.play()
+            if ch is None:
+                return None
+            ch.set_volume(left, right)
+        except Exception:
+            return None
+        self.played[name] = self.played.get(name, 0) + 1
+        return ch
+
     def step(self) -> bool:
         """A soft footstep, never the same sample twice running."""
         choices = [n for n in STEP_SOUNDS if n != self.last_step]
@@ -1162,16 +1197,17 @@ def _load_char_sprites(files: dict):
 
 
 def _make_cloak_icon() -> pygame.Surface:
-    """Fallback Chameleon Cloak badge if the PNG is missing."""
-    W, H = 48, 56
-    surf = _new_rgba((W, H))
-    pygame.draw.ellipse(surf, (186, 150, 70, 255), (4, 2, 40, 48))
-    pygame.draw.ellipse(surf, (48, 58, 72, 255), (8, 6, 32, 40))
-    pygame.draw.ellipse(surf, (70, 196, 110, 255), (16, 16, 16, 16))
-    pygame.draw.ellipse(surf, (180, 255, 200, 255), (20, 20, 8, 8))
-    pygame.draw.rect(surf, (20, 14, 10, 255), (10, H - 10, W - 20, 6))
-    pygame.draw.rect(surf, (40, 120, 60, 255), (11, H - 9, W - 22, 4))
-    return _finish_rgba(surf)
+    """Fallback Chameleon Cloak badge if the PNG is missing. Drawn 4x larger
+    and smooth-scaled down, so its edges are antialiased like the PNG's."""
+    W, H, S = 48, 56, 4
+    surf = _new_rgba((W * S, H * S))
+    pygame.draw.ellipse(surf, (186, 150, 70, 255), (4 * S, 2 * S, 40 * S, 48 * S))
+    pygame.draw.ellipse(surf, (48, 58, 72, 255), (8 * S, 6 * S, 32 * S, 40 * S))
+    pygame.draw.ellipse(surf, (70, 196, 110, 255), (16 * S, 16 * S, 16 * S, 16 * S))
+    pygame.draw.ellipse(surf, (180, 255, 200, 255), (20 * S, 20 * S, 8 * S, 8 * S))
+    pygame.draw.rect(surf, (20, 14, 10, 255), (10 * S, (H - 10) * S, (W - 20) * S, 6 * S))
+    pygame.draw.rect(surf, (40, 120, 60, 255), (11 * S, (H - 9) * S, (W - 22) * S, 4 * S))
+    return _finish_rgba(pygame.transform.smoothscale(surf, (W, H)))
 
 
 class Game:
@@ -1275,6 +1311,13 @@ class Game:
         self.hum_assign = [None] * HUM_CHANNELS
         self.hum_ch_gain = [0.0] * HUM_CHANNELS
         self.hum_releasing = [False] * HUM_CHANNELS
+        self.taunt_rng = random.Random()
+        self.taunt_at = None         # game time of the next ambient callout
+        self.taunt_ch = None         # channel of the callout being said
+        self.taunt_dalek = None      # ... and the Dalek saying it
+        self.taunt_name = None
+        self.taunt_until = -1e9
+        self.taunt_last = None
         self.mode = "title" if title else "play"
         self.title_pick = CHAR_ORDER.index(self.character) if self.character in CHAR_ORDER else 0
         seed0 = seed if seed is not None else (time.time_ns() & 0x7FFFFFFF)
@@ -1332,6 +1375,8 @@ class Game:
             real = self.sfx.length_ms("tardis_demat", DEMAT_MS)
             self.demat_len = max(DEMAT_MIN_MS, min(DEMAT_MAX_MS, real))
         self.sfx.stop_all()
+        self._stop_taunt()
+        self.taunt_at = None
         self.hum_assign = [None] * HUM_CHANNELS
         self.hum_ch_gain = [0.0] * HUM_CHANNELS
         self.hum_releasing = [False] * HUM_CHANNELS
@@ -1372,6 +1417,8 @@ class Game:
         self.rustle_t = -1e9
         self.ow_quiet_until = -1e9
         self.voice_until = -1e9
+        self._stop_taunt()
+        self.taunt_at = None         # scheduled on the first update of the level
         self.hops_heard = 0
         self.seed = seed & 0x7FFFFFFF
         self.grid = generate_maze(MAZE_SIZE, self.seed)
@@ -1581,12 +1628,14 @@ class Game:
         """'Exterminate!' as the telegraph starts; one voice at a time."""
         if now < self.voice_until:
             return
+        self._stop_taunt()  # the real warning always wins over a callout
         self.voice_until = now + self.sfx.length_ms("exterminate", 1600.0)
         self.sfx.play("exterminate")
 
     def _kill(self, now: float, shooter: Dalek):
         if self.dead or self.won:
             return
+        self._stop_taunt()
         self.sfx.play("laser")
         self.dead_pos = self.visual_pos(now)
         self.dead = True
@@ -1949,6 +1998,7 @@ class Game:
             self.card_t0 = None
             self.last_now = now
         if self.won:
+            self._stop_taunt()
             self._update_exit(now)
             self._update_hum(now, dt)
             return  # Daleks freeze while Archie leaves
@@ -1967,6 +2017,7 @@ class Game:
                 self._start_disguise(now)
         self._update_daleks(now, dt)
         self._update_hum(now, dt)
+        self._update_taunt(now)
 
     # ----- Reaching the TARDIS --------------------------------------------
     def _begin_exit(self, now: float):
@@ -2122,6 +2173,89 @@ class Game:
             left, right = d.hum_lr if d is not None else (0.0, 0.0)
             g = gains[ci] * self.hum_gain
             self.sfx.set_hum(ci, left * g, right * g, nearby)
+
+    # ----- Ambient Dalek callouts ------------------------------------------
+    @staticmethod
+    def _hum_closeness(dist: float) -> float:
+        """0..1 loudness for a Dalek `dist` cells away: the hum's own curve
+        (silent at HUM_FAR, full at HUM_NEAR, shaped by HUM_CURVE)."""
+        u = max(0.0, min(1.0, (HUM_FAR - dist) / (HUM_FAR - HUM_NEAR)))
+        return u ** HUM_CURVE
+
+    def _taunt_levels(self, d: Dalek, now: float):
+        """(left, right) channel volume for a callout from Dalek d, using the
+        same distance (_hum_distance), closeness curve and stereo pan as its
+        hum, scaled to TAUNT_MAX instead of HUM_MAX."""
+        archie_pos = self.visual_pos(now)
+        vol = TAUNT_MAX * self._hum_closeness(self._hum_distance(d, archie_pos))
+        if vol < 0.002:
+            return 0.0, 0.0
+        ax, _ = tile_origin(*archie_pos)
+        dx, _ = tile_origin(d.pos[0], d.pos[1])
+        pan = max(-1.0, min(1.0, (dx - ax) / (self.view_w / 2))) * HUM_PAN
+        return vol * (1.0 - max(0.0, pan)), vol * (1.0 + min(0.0, pan))
+
+    def _stop_taunt(self):
+        ch = getattr(self, "taunt_ch", None)
+        if ch is not None:
+            try:
+                ch.stop()
+            except Exception:
+                pass
+        self.taunt_ch = None
+        self.taunt_dalek = None
+        self.taunt_name = None
+        self.taunt_until = -1e9
+
+    def _schedule_taunt(self, now: float):
+        self.taunt_at = now + self.taunt_rng.uniform(TAUNT_MIN_MS, TAUNT_MAX_MS)
+
+    def _update_taunt(self, now: float):
+        """Every 30-45 s of play the nearest Dalek says a random callout,
+        one at a time; while it speaks its volume follows that Dalek."""
+        if self.mode != "play" or self.dead or self.won or self.card_t0 is not None:
+            self._stop_taunt()
+            return
+        if self.taunt_ch is not None:
+            if now >= self.taunt_until or self.taunt_dalek not in self.daleks or self.sfx.muted:
+                # Finished (or muted: M already stopped every channel). Keep
+                # taunt_until so a muted-then-unmuted line is not stacked on.
+                self.taunt_ch = None
+                self.taunt_dalek = None
+            else:
+                try:
+                    self.taunt_ch.set_volume(*self._taunt_levels(self.taunt_dalek, now))
+                except Exception:
+                    pass
+        if self.taunt_at is None:
+            self._schedule_taunt(now)
+            return
+        if now < self.taunt_at:
+            return
+        # Due. Never over another voice (a callout or "Exterminate!") or while
+        # a Dalek is lining up a shot: try again in a moment.
+        if (now < self.taunt_until or now < self.voice_until
+                or any(d.state in ("aim", "fire") for d in self.daleks)):
+            self.taunt_at = now + TAUNT_RETRY_MS
+            return
+        self._schedule_taunt(now)
+        if not self.daleks:
+            return
+        archie_pos = self.visual_pos(now)
+        nearest = min(self.daleks, key=lambda d: self._hum_distance(d, archie_pos))
+        left, right = self._taunt_levels(nearest, now)
+        if left <= 0.0 and right <= 0.0:
+            return  # every Dalek is out of earshot: this one goes unsaid
+        pool = [n for n in TAUNT_SOUNDS if n != self.taunt_last] or list(TAUNT_SOUNDS)
+        name = self.taunt_rng.choice(pool)
+        self.taunt_last = name
+        ch = self.sfx.play_voice(name, left, right)
+        if ch is None:
+            return  # muted or no audio
+        self.taunt_ch = ch
+        self.taunt_dalek = nearest
+        self.taunt_name = name
+        self.taunt_until = now + self.sfx.length_ms(name, 1800.0)
 
     def _update_archie(self, now: float):
         if self.turning:

@@ -70,16 +70,18 @@ All sounds are small WAV files in `assets/sounds/` (22050 Hz, 16-bit mono):
 | `cloak_on.wav` | The hedge disguise starts (also when it kicks in after a hop lands) | Synthesised: a quick rising run of wind-chime bells (C6 to E7, pentatonic) over a fluttering shimmer, about 0.46 s |
 | `cloak_off.wav` | The hedge disguise ends (time runs out or H is pressed again) | Synthesised: the same chimes as a falling run, about 0.46 s |
 | `exterminate.wav` | A Dalek spots Archie | espeak-ng, one syllable at a time (EX-TER-MIN-ATE!), then a 30 Hz ring modulator, distortion and a short metallic echo |
+| `dalek_human_detected.wav`, `dalek_destroy.wav`, `dalek_find_the_human.wav` | Ambient callouts: every 30 to 45 s of play (random each time) the nearest Dalek says one of them at random (never the same twice running, one at a time). It is exactly as loud as that Dalek's hum would be (same straight-line distance, silent from about 25 cells, louder up close, same left/right pan), and follows the Dalek while it speaks. Skipped if every Dalek is out of earshot; held back while another voice is speaking or a Dalek is aiming; cut short by "Exterminate!". Never on the title screen, while dead or leaving in the TARDIS; M mutes them | The same voice chain as `exterminate.wav` (HU-MAN DE-TEC-TED!, DE-STROY!, FIND THE HU-MAN!) |
 | `laser.wav` | The Dalek fires | Synthesised: a descending zap with buzz and crackle |
 | `step1.wav`, `step2.wav`, `step3.wav` | One soft footstep per half-tile hop, varied | Synthesised: a low thump plus a little gravel crunch |
 | `dalek_hum.wav` | Loops for each Dalek gliding within about 25 cells (straight line), faint far off and louder up close, panned a little left or right; it fades out while the Dalek turns or stands still. Four mixer channels carry the hums of the four loudest Daleks | Synthesised 2 s seamless loop: detuned saw and square oscillators (110, 111, 165 and 220.5 Hz) through a resonant filter sweeping 400 to 2500 Hz twice per loop, a 4 Hz throb, an FM shimmer and an electronic whoosh. Pitched so laptop speakers can play it |
 | `title_theme.wav` | Loops on the title screen (muted with M); stops when a game starts. Dalek hums stay silent on the title | Synthesised 12 s seamless loop: heavy 55 Hz bass throb, whooshy swept-noise pad, eerie minor lead motif, soft shimmer and drone. Original electronic track inspired by Doctor Who *vibes* only — not the BBC theme |
 | `tardis_demat.wav` | The TARDIS dematerialises, 5 s into each level, and again when Archie leaves in it | A supplied recording. `tools/make_sounds.py` can also synthesise an original wheeze-groan here (three rising-and-falling grinding groans with ring-modulated metallic overtones, reverb and a soft thud), but it keeps an existing file unless you pass `--overwrite-tardis` |
 
-To regenerate them (needs numpy; the two voices also need `espeak-ng`, for example `sudo apt install espeak-ng`):
+To regenerate them (needs numpy; the voices also need `espeak-ng`, for example `sudo apt install espeak-ng`):
 
 ```bash
 python3 tools/make_sounds.py
+python3 tools/make_sounds.py --only dalek_human_detected dalek_destroy dalek_find_the_human   # just these, leave the rest
 python3 tools/make_sounds.py --spectrograms /tmp   # optional spectrogram PNGs (the hum is shown looped twice)
 ```
 
@@ -89,7 +91,7 @@ If the computer has no working audio, or a sound file is missing, the game still
 
 ## Effects and HUD
 
-The world, HUD text, laser and overlays are all drawn on the low-resolution view and nearest-neighbour scaled up, so UI looks as chunky as the maze. The Dalek laser and glows use solid-colour lines and circles. The TARDIS roof-lamp glow and the Chameleon Cloak badge are PNGs in `assets/fx/`, made by:
+The world, HUD text, laser and overlays are all drawn on the low-resolution view and nearest-neighbour scaled up, so UI looks as chunky as the maze. The Dalek laser and glows use solid-colour lines and circles. The TARDIS roof-lamp glow and the Chameleon Cloak badge are PNGs in `assets/fx/`. The cloak badge is the one antialiased graphic: it is rendered with 4x4 supersampling, so its curved edges are soft rather than stair-stepped (the HUD box, meter and text stay chunky). They are made by:
 
 ```bash
 python3 tools/make_fx.py

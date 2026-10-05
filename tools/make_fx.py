@@ -40,27 +40,52 @@ def save_png(arr: np.ndarray, name: str):
     print("wrote", os.path.relpath(path, ROOT), f"{w}x{h}")
 
 
-def chameleon_cloak():
-    """Oval badge with a green gem and a charge slot along the bottom."""
+CLOAK_SS = 4  # supersampling per axis for the cloak badge (4x4 = 16 samples a pixel)
+
+
+def chameleon_cloak(ss: int = CLOAK_SS):
+    """Oval badge with a green gem and a charge slot along the bottom.
+
+    Antialiased: every shape is tested at ss x ss points inside each pixel and
+    the coverage is averaged (premultiplied), so the curved edges get soft
+    partial-alpha pixels instead of hard stair-steps. The shapes and sizes are
+    the same as the old hard-edged badge (pixel centres sit on whole numbers).
+    """
     W, H = 48, 56
-    yy, xx = np.mgrid[0:H, 0:W]
+    # Sample coordinates in pixel units: pixel i spans i-0.5 .. i+0.5.
+    sy = (np.arange(H * ss) + 0.5) / ss - 0.5
+    sx = (np.arange(W * ss) + 0.5) / ss - 0.5
+    yy, xx = np.meshgrid(sy, sx, indexing="ij")
     cx, cy = W / 2, H / 2 - 2
-    arr = np.zeros((H, W, 4), np.uint8)
+    rgb = np.zeros((H * ss, W * ss, 3), np.float64)
+    alpha = np.zeros((H * ss, W * ss), np.float64)
+
+    def paint(mask, colour):
+        rgb[mask] = colour
+        alpha[mask] = 1.0
+
     body = ((xx - cx) / 18) ** 2 + ((yy - cy) / 22) ** 2 <= 1.0
-    rim = (((xx - cx) / 20) ** 2 + ((yy - cy) / 24) ** 2 <= 1.0) & ~body
-    arr[rim] = (186, 150, 70, 255)
-    arr[body] = (48, 58, 72, 255)
-    inner = ((xx - cx) / 14) ** 2 + ((yy - cy) / 16) ** 2 <= 1.0
-    arr[inner] = (36, 44, 56, 255)
-    gem = (xx - cx) ** 2 + (yy - cy + 2) ** 2 <= 36
-    arr[gem] = (70, 196, 110, 255)
-    gem2 = (xx - cx) ** 2 + (yy - cy + 2) ** 2 <= 12
-    arr[gem2] = (180, 255, 200, 255)
-    arr[H - 10:H - 4, 10:W - 10] = (20, 14, 10, 255)
-    arr[H - 9:H - 5, 11:W - 11] = (40, 120, 60, 255)
+    rim = ((xx - cx) / 20) ** 2 + ((yy - cy) / 24) ** 2 <= 1.0
+    paint(rim, (186, 150, 70))
+    paint(body, (48, 58, 72))
+    paint(((xx - cx) / 14) ** 2 + ((yy - cy) / 16) ** 2 <= 1.0, (36, 44, 56))
+    paint((xx - cx) ** 2 + (yy - cy + 2) ** 2 <= 36, (70, 196, 110))
+    paint((xx - cx) ** 2 + (yy - cy + 2) ** 2 <= 12, (180, 255, 200))
+
+    def rect(x0, x1, y0, y1):  # pixel columns x0..x1-1, rows y0..y1-1 (whole pixels, crisp)
+        return (xx >= x0 - 0.5) & (xx < x1 - 0.5) & (yy >= y0 - 0.5) & (yy < y1 - 0.5)
+
+    paint(rect(10, W - 10, H - 10, H - 4), (20, 14, 10))
+    paint(rect(11, W - 11, H - 9, H - 5), (40, 120, 60))
     for px, py in ((cx - 12, cy - 14), (cx + 12, cy - 14), (cx - 12, cy + 12), (cx + 12, cy + 12)):
-        arr[(xx - px) ** 2 + (yy - py) ** 2 <= 4] = (212, 180, 90, 255)
-    return arr
+        paint((xx - px) ** 2 + (yy - py) ** 2 <= 4, (212, 180, 90))
+    # Box-filter down to W x H, premultiplied so edges don't pick up black.
+    pre = (rgb * alpha[..., None]).reshape(H, ss, W, ss, 3).mean(axis=(1, 3))
+    a = alpha.reshape(H, ss, W, ss).mean(axis=(1, 3))
+    out = np.zeros((H, W, 4), np.uint8)
+    out[..., :3] = np.where(a[..., None] > 0, pre / np.maximum(a[..., None], 1e-9), 0).round().clip(0, 255)
+    out[..., 3] = (a * 255.0).round().clip(0, 255)
+    return out
 
 
 def main() -> int:
