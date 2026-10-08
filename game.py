@@ -3262,6 +3262,30 @@ class Game:
         screen.blit(panel, ((self.view_w - width) // 2, (self.view_h - height) // 2))
 
 
+    def _title_char_select_bounds(self):
+        """Top, bottom and vertical centre of the character-choice block.
+
+        Matches `_draw_title_portraits`: frames from pad_top above the sprites
+        down through pad_bot, plus the SELECTED label 14px above the frame.
+        """
+        pad_top, pad_bot = 14, 34
+        img_h = max(self.char_sets[cid]["portrait"].get_height() for cid in CHAR_ORDER)
+        y0 = self.view_h // 2 - 50
+        by = y0 - pad_top
+        bh = pad_top + img_h + pad_bot
+        top = by - 14  # SELECTED sits above the frame
+        bot = by + bh
+        return top, bot, (top + bot) / 2.0, y0
+
+    def _title_footer_help_y(self) -> int:
+        """Y of the first controls-help line on the title screen."""
+        copy_margin = 8
+        copy_gap = 10
+        n_help = 3
+        copy_lines = _wrap_text(self.font_title_copy, TITLE_COPYRIGHT, self.view_w - copy_margin * 2)
+        copy_y0 = self.view_h - 6 - copy_gap * len(copy_lines)
+        return copy_y0 - 6 - 14 * n_help
+
     def _draw_title(self, screen, now: float):
         """Title overlay on the live decorative maze: name, portraits, help."""
         # Soft dark veil so the text is readable over the scrolling maze.
@@ -3275,31 +3299,52 @@ class Game:
         screen.blit(title, (tx, 7))
         t0 = self.title_t0 if self.title_t0 is not None else now
         show_scores = int((now - t0) // TITLE_PANEL_MS) % 2 == 1
-        sub_text = "Top 10 Scores" if show_scores else "Choose Archie or Holly"
-        sub = self.font_title_sub.render(sub_text, True, (220, 200, 160))
-        sub_y = 7 + title.get_height() + 4
-        screen.blit(sub, ((self.view_w - sub.get_width()) // 2, sub_y))
         if show_scores:
-            self._draw_title_scores(screen, sub_y + sub.get_height() + 6)
+            # Heading + panel share the character-choice block's vertical centre.
+            self._draw_title_scores(screen, title_bottom=7 + title.get_height())
         else:
+            sub = self.font_title_sub.render("Choose Archie or Holly", True, (220, 200, 160))
+            sub_y = 7 + title.get_height() + 4
+            screen.blit(sub, ((self.view_w - sub.get_width()) // 2, sub_y))
             self._draw_title_portraits(screen)
         self._draw_title_footer(screen)
 
-    def _draw_title_scores(self, screen, top: int):
-        """Top 10 panel (rank, name, score) from dreamlo or the local cache."""
+    def _draw_title_scores(self, screen, title_bottom: int):
+        """Top 10 heading + panel, centred on the character-choice block."""
         entries = self.board.top(TOP_N)
         status = self.board.status
         cream, gold, dim = (240, 234, 214), (255, 220, 120), (200, 180, 140)
+        heading = self.font_title_sub.render("Top 10 Scores", True, (220, 200, 160))
+        head_gap = 6  # space between heading and panel
         font = self.font_title_help
-        row_h = 14
         pad_x, pad_y = 16, 8
         rank_w = font.size("10.")[0]
         name_w = font.size("W" * NAME_MAX)[0]
         score_w = font.size("000000")[0]
         col_gap = 18
         width = pad_x * 2 + rank_w + col_gap + name_w + col_gap + score_w
-        height = pad_y * 2 + row_h * TOP_N + (row_h if status == "offline" else 0)
-        panel = _new_rgba((width, height))
+        _, _, centre_y, _ = self._title_char_select_bounds()
+        min_top = title_bottom + 4
+        max_bot = self._title_footer_help_y() - 8
+        avail = max(40, max_bot - min_top)
+
+        def unit_height(row_h: int) -> tuple[int, int]:
+            offline_extra = row_h if status == "offline" else 0
+            panel_h = pad_y * 2 + row_h * TOP_N + offline_extra
+            return heading.get_height() + head_gap + panel_h, panel_h
+
+        row_h = 14
+        unit_h, panel_h = unit_height(row_h)
+        while unit_h > avail and row_h > 10:
+            row_h -= 1
+            unit_h, panel_h = unit_height(row_h)
+
+        top = int(round(centre_y - unit_h / 2.0))
+        top = max(min_top, min(top, max_bot - unit_h))
+        screen.blit(heading, ((self.view_w - heading.get_width()) // 2, top))
+        panel_top = top + heading.get_height() + head_gap
+
+        panel = _new_rgba((width, panel_h))
         panel.fill((36, 24, 16, 215))
         pygame.draw.rect(panel, (255, 220, 120, 255), panel.get_rect(), 2)
         x_rank = pad_x
@@ -3308,7 +3353,7 @@ class Game:
         if not entries:
             msg = "Loading scores" if status == "loading" else "No scores yet - be the first!"
             t = font.render(msg, True, cream)
-            panel.blit(t, ((width - t.get_width()) // 2, (height - t.get_height()) // 2))
+            panel.blit(t, ((width - t.get_width()) // 2, (panel_h - t.get_height()) // 2))
         for i in range(TOP_N):
             y = pad_y + i * row_h
             colour = gold if i == 0 else (cream if i < 3 else dim)
@@ -3322,7 +3367,7 @@ class Game:
         if status == "offline":
             t = self.font_title_copy.render("Offline - showing saved scores", True, dim)
             panel.blit(t, ((width - t.get_width()) // 2, pad_y + row_h * TOP_N + 2))
-        screen.blit(_finish_rgba(panel), ((self.view_w - width) // 2, top))
+        screen.blit(_finish_rgba(panel), ((self.view_w - width) // 2, panel_top))
 
     def _draw_title_portraits(self, screen):
         # Portraits — boxes sized for the larger title fonts (name under each).
@@ -3334,7 +3379,7 @@ class Game:
         # Centre by the highlight frames (wider than the sprites).
         total_w = sum(cs["portrait"].get_width() + pad_x * 2 for _, cs in portraits) + gap
         x0 = (self.view_w - total_w) // 2 + pad_x
-        y0 = self.view_h // 2 - 50
+        _, _, _, y0 = self._title_char_select_bounds()
         for i, (cid, cs) in enumerate(portraits):
             img = cs["portrait"]
             selected = i == self.title_pick
@@ -3370,7 +3415,7 @@ class Game:
         copy_lines = _wrap_text(self.font_title_copy, TITLE_COPYRIGHT, self.view_w - copy_margin * 2)
         copy_block_h = copy_gap * len(copy_lines)
         copy_y0 = self.view_h - 6 - copy_block_h
-        help_y = copy_y0 - 6 - 14 * len(lines)
+        help_y = self._title_footer_help_y()
         y = help_y
         for line in lines:
             t = self.font_title_help.render(line, True, (230, 214, 180))
