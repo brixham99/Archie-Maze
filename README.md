@@ -31,7 +31,13 @@ Every 7 seconds the middle of the title screen swaps between the character choic
 
 ## Score and leaderboard
 
-You score **1 point for every second** you survive in a maze and **50 points for each new level** you reach. The time does not count on the title screen, during the level card, while walking into the TARDIS, or after you are exterminated. Your score and the current high score are shown top-left, under the level box; the high score turns gold once you beat it.
+Points come three ways:
+
+- **1 point for every second on the move.** Time only counts while you are actually stepping from one cell to the next, plus a short 0.4 s grace after each step lands so tapping or holding the keys to walk counts smoothly. Standing still, turning on the spot, hiding under the Chameleon Cloak or bumping into a hedge earns nothing.
+- **20 points each time a Dalek spots you** and shouts "Exterminate!", awarded the moment it shouts, even if the laser then gets you. One shout is one bonus: two Daleks spotting you together, or the same Dalek re-spotting you while it is still shouting, only counts once. A brief gold **+20** pops up beside the Score box. The random callouts ("Human detected!", "Destroy!", "Find the human!") are not worth anything.
+- **50 points for each new level** you reach.
+
+Nothing counts on the title screen, during the level card, while walking into the TARDIS, or after you are exterminated. Your score and the current high score are shown top-left, under the level box; the high score turns gold once you beat it.
 
 When you are exterminated with at least one point, type a name (up to 8 letters, digits or spaces), then Enter to send it or Esc to skip. The last name you used is filled in for you. Scores go to a free [dreamlo](http://dreamlo.com) leaderboard, which keeps each name's best score. Public Top 10: <http://dreamlo.com/lb/6ac7b3018f40bc15a8400bbc/json>
 

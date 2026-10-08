@@ -227,9 +227,14 @@ MIXER_FREQ = 22050
 MIXER_BUFFER = 512           # ~23 ms at 22050 Hz: small, so sounds aren't laggy
 RESTART_KEYS = (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_r, pygame.K_SPACE)
 
-# Score: a point for every second survived in play, a bonus for each new level.
+# Score: a point for every second spent on the move (stepping between cells,
+# not standing, turning on the spot, cloaked or bumping a hedge), a bonus for
+# each new level, and a bonus each time a Dalek spots you and shouts.
 SCORE_PER_SECOND = 1
 SCORE_PER_LEVEL = 50
+SCORE_PER_SPOT = 20          # a Dalek sees you and shouts "Exterminate!"
+MOVE_GRACE_MS = 400          # time still counts this long after a step lands (tap gaps)
+BONUS_POP_MS = 1100          # the "+20" pop beside the Score box
 NAME_MAX = 8                 # leaderboard names: letters, digits and spaces
 TITLE_PANEL_MS = 7000        # title alternates: character choice <-> Top 10, 7 s each
 TOP_N = 10
@@ -1515,8 +1520,11 @@ class Game:
 
     # ----- Score and leaderboard ------------------------------------------
     def _reset_score(self):
-        self.survive_ms = 0.0
+        self.survive_ms = 0.0        # time on the move (only counts while stepping)
         self.level_bonus = 0
+        self.spot_bonus = 0          # +SCORE_PER_SPOT per "Exterminate!"
+        self.bonus_pop_t0 = None
+        self.move_grace_until = -1e9
         self.entry_active = False    # typing a name for the leaderboard
         self.entry_done = False
         self.entry_name = ""
@@ -1525,7 +1533,16 @@ class Game:
 
     @property
     def score(self) -> int:
-        return int(self.survive_ms // 1000) * SCORE_PER_SECOND + self.level_bonus
+        return int(self.survive_ms // 1000) * SCORE_PER_SECOND + self.level_bonus + self.spot_bonus
+
+    def _on_the_move(self, now: float) -> bool:
+        """Time points only while Archie is actually travelling between cells,
+        plus a short grace after each step lands so walking with key-repeat
+        gaps counts smoothly. Standing, turning on the spot, cloaked or
+        bumping a hedge (no step starts) earn nothing."""
+        if self.disguised:
+            return False
+        return self.moving or now < self.move_grace_until
 
     def wants_text(self) -> bool:
         """True while a name is being typed (Esc then skips instead of quitting)."""
@@ -1656,6 +1673,8 @@ class Game:
         self.rustle_t = -1e9
         self.ow_quiet_until = -1e9
         self.voice_until = -1e9
+        self.move_grace_until = -1e9
+        self.bonus_pop_t0 = None
         self._stop_taunt()
         self.taunt_at = None         # scheduled on the first update of the level
         self.hops_heard = 0
@@ -1864,12 +1883,20 @@ class Game:
                     break
 
     def _shout(self, now: float):
-        """'Exterminate!' as the telegraph starts; one voice at a time."""
+        """'Exterminate!' as the telegraph starts; one voice at a time.
+
+        Each shout that is actually voiced is worth SCORE_PER_SPOT. It is only
+        called as a Dalek goes from roaming to aiming, and the voice gate means
+        two Daleks spotting together (or one re-spotting while it is still
+        shouting) is one shout and one bonus."""
         if now < self.voice_until:
             return
         self._stop_taunt()  # the real warning always wins over a callout
         self.voice_until = now + self.sfx.length_ms("exterminate", 1600.0)
         self.sfx.play("exterminate")
+        if self.mode == "play" and not (self.dead or self.won):
+            self.spot_bonus += SCORE_PER_SPOT
+            self.bonus_pop_t0 = now
 
     def _kill(self, now: float, shooter: Dalek):
         if self.dead or self.won:
@@ -1970,6 +1997,8 @@ class Game:
             # A level under way: a couple of minutes survived plus the level bonuses.
             self.level_bonus = SCORE_PER_LEVEL * (self.level - 1)
             self.survive_ms = 127_400.0
+            self.spot_bonus = SCORE_PER_SPOT * 2
+            self.bonus_pop_t0 = now - 150.0  # the "+20" pop just after a spot
             self._park_other_daleks(None)
             self.start_t0 = now - DEMAT_WAIT_MS - self.demat_len - 1000
             self.demat_t0 = self.start_t0 + DEMAT_WAIT_MS
@@ -2277,7 +2306,8 @@ class Game:
         if self.disguised and now - self.disguise_t0 >= DISGUISE_MS:
             self._end_disguise(now)
         if not self.dead:
-            self.survive_ms += dt  # in play only: not the title, card, exit or death
+            if self._on_the_move(now):
+                self.survive_ms += dt  # on the move in play only: not the title, card, exit or death
         elif not self.entry_active and not self.entry_done and now - self.death_t0 >= DEATH_MSG_MS:
             self._begin_entry()
         if not self.dead:
@@ -2547,6 +2577,7 @@ class Game:
                 self.sfx.step()
             self.col, self.row = self.dst
             self.moving = False
+            self.move_grace_until = now + MOVE_GRACE_MS
             if self.grid[self.row][self.col] == EXIT:  # (normally caught as the step starts)
                 self._begin_exit(now)
                 return
@@ -2617,7 +2648,7 @@ class Game:
             self._draw_minimap(view)
             self._draw_cloak_hud(view, now)
             self._draw_level_hud(view)
-            self._draw_score_hud(view)
+            self._draw_score_hud(view, now)
             if self.dead and now - self.death_t0 >= DEATH_MSG_MS:
                 who = self.char_name
                 if self.entry_active:
@@ -3049,7 +3080,7 @@ class Game:
         screen.blit(box, (8, 8))
         screen.blit(text, (8 + pad_x, 8 + pad_y))
 
-    def _draw_score_hud(self, screen):
+    def _draw_score_hud(self, screen, now: float | None = None):
         """Score and high score, under the level box (top-left)."""
         best = self.board.high_score()
         score = self.score
@@ -3073,6 +3104,18 @@ class Game:
             box.blit(v, (w - pad_x - v.get_width(), y))
         y0 = 8 + self.font_hud.get_height() + 10 + 4  # just under the level box
         screen.blit(_finish_rgba(box), (8, y0))
+        if now is not None and self.bonus_pop_t0 is not None:
+            t = (now - self.bonus_pop_t0) / BONUS_POP_MS
+            if 0.0 <= t < 1.0:
+                # "+20" beside the Score row: drifts up a few pixels and fades.
+                fade = 1.0 if t < 0.6 else 1.0 - (t - 0.6) / 0.4
+                text = f"+{SCORE_PER_SPOT}"
+                surf = self.font_score.render(text, True, (255, 220, 120))
+                shadow = self.font_score.render(text, True, (20, 12, 6))
+                x = 8 + w + 5
+                y = y0 + pad_y - int(round(6 * t))
+                screen.blit(_alpha_scaled(shadow, fade * 0.8), (x + 1, y + 1))
+                screen.blit(_alpha_scaled(surf, fade), (x, y))
 
     def _draw_name_entry(self, screen, now: float):
         """After a death with points: type a name for the leaderboard."""
