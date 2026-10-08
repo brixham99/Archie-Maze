@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archie's hedge maze — a small isometric maze in pygame.
+"""Daleks in Hedges — a small isometric hedge-maze game in pygame.
 
 Play:  python3 game.py
 Test:  SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --screenshot preview.png --frames 8

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Archie Maze sound effects as small WAV files.
+"""Generate the Daleks in Hedges sound effects as small WAV files.
 
     python3 tools/make_sounds.py                 # writes assets/sounds/*.wav
     python3 tools/make_sounds.py --spectrograms DIR

@@ -7,11 +7,19 @@ The game opens on a **title screen** with a live decorative maze (ten Daleks roa
 ## Play
 
 ```bash
-git clone https://github.com/brixham99/Archie-Maze.git
-cd Archie-Maze
-pip install -r requirements.txt
+git clone https://github.com/brixham99/Daleks-in-Hedges.git
+cd Daleks-in-Hedges
+python3 -m pip install -r requirements.txt
 python3 game.py
 ```
+
+If pygame fails to build (common on very new Pythons such as 3.14, which show a "Failed building wheel" error), install pygame-ce instead. It is a drop-in replacement with ready-made downloads:
+
+```bash
+python3 -m pip install pygame-ce numpy
+```
+
+Cloned it under the old name? GitHub redirects the old address, so `git pull` still works; to tidy up, run `git remote set-url origin https://github.com/brixham99/Daleks-in-Hedges.git` and rename the folder to `Daleks-in-Hedges`.
 
 | Key | Action |
 | --- | --- |
