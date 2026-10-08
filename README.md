@@ -7,7 +7,7 @@ The game opens on a **title screen** with a live decorative maze (ten Daleks roa
 ## Play
 
 ```bash
-gti clone https://github.com/brixham99/Archie-Maze.git
+git clone https://github.com/brixham99/Archie-Maze.git
 cd Archie-Maze
 pip install -r requirements.txt
 python3 game.py
