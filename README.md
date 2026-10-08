@@ -27,6 +27,18 @@ A Dalek sees Archie only along the corridor it is facing, up to 8 cells away wit
 
 A live maze scrolls behind the menu with ten Daleks roaming for atmosphere (they cannot kill you there). Choose **Archie** or **Holly** with Left/Right, A/D, or 1/2, then Enter or Space to start. An original electronic title theme loops here (M mutes it); Dalek hums are silent until you play. Controls are listed on the title screen.
 
+Every 7 seconds the middle of the title screen swaps between the character choice and the online **Top 10 scores**. Choosing keys work at any time (and bring the characters back); Enter or Space starts straight away.
+
+## Score and leaderboard
+
+You score **1 point for every second** you survive in a maze and **50 points for each new level** you reach. The time does not count on the title screen, during the level card, while walking into the TARDIS, or after you are exterminated. Your score and the current high score are shown top-left, under the level box; the high score turns gold once you beat it.
+
+When you are exterminated with at least one point, type a name (up to 8 letters, digits or spaces), then Enter to send it or Esc to skip. The last name you used is filled in for you. Scores go to a free [dreamlo](http://dreamlo.com) leaderboard, which keeps each name's best score. Public Top 10: <http://dreamlo.com/lb/6ac7b3018f40bc15a8400bbc/json>
+
+All leaderboard traffic happens in the background with a short timeout, so the game never waits for it. Offline, the last Top 10 is shown from a local cache and unsent scores are kept and sent next time the title screen is reached online. The cache, your last name and your local best live in `~/.daleks_in_hedges/scores.json`. Run with `--offline` to never contact dreamlo.
+
+Note: free dreamlo boards are client-side by design, so the private code that adds scores is in `game.py` and anyone reading the source could post or clear scores. That is fine for a family game; for anything more serious use a leaderboard with a server-side secret.
+
 ## Chameleon Cloak
 
 Press **H** (or Shift) to become a hedge for up to 4 seconds. Daleks cannot see you while you are cloaked. A device graphic in the bottom-right corner shows the charge (ready / depleting / recharging). Peeking eyes still show so you can find yourself.
@@ -106,7 +118,7 @@ SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --screenshot shot.png --frames 20
 SDL_VIDEODRIVER=dummy python3 game.py --seed 1 --scene laser --screenshot laser.png
 ```
 
-Scenes: `dalek`, `laser`, `telegraph`, `disguise`, `tardis`, `tardis_demat`, `tardis_exit`, `title`. Add `--scene-ms N` to choose how far into the scene the shot is taken, for example `--scene tardis_demat --scene-ms 6500` (the TARDIS waits 5 s, so that is 1.5 s into the dematerialisation).
+Scenes: `dalek`, `laser`, `telegraph`, `disguise`, `tardis`, `tardis_demat`, `tardis_exit`, `title`, `title_top10`, `score_hud`, `name_entry`. Headless runs never contact dreamlo or write the score file; add `--demo-scores` to fill the Top 10 with sample names for a screenshot. Add `--scene-ms N` to choose how far into the scene the shot is taken, for example `--scene tardis_demat --scene-ms 6500` (the TARDIS waits 5 s, so that is 1.5 s into the dematerialisation).
 
 `tardis_exit` puts Archie next to the TARDIS and steps him in. Use `--scene-ms` to follow the whole exit sequence. With a 6.6 s TARDIS sound: Archie walks in and fades out over 0 to 0.5 s, the dematerialisation runs from 0.9 s to about 7.5 s, the "Level 2" card from about 7.8 to 9.7 s, and level 2 starts after that.
 

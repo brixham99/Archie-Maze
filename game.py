@@ -11,11 +11,15 @@ The maze stays put; the camera scrolls so he stays centred.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
 import sys
+import threading
 import time
+import urllib.parse
+import urllib.request
 
 # Headless runs (dummy video) need no audio device either. Normal runs use
 # the real sound card; if the mixer cannot start, the game just stays silent.
@@ -222,6 +226,21 @@ HUM_PAN = 0.45               # subtle stereo: at most 45% off the far side
 MIXER_FREQ = 22050
 MIXER_BUFFER = 512           # ~23 ms at 22050 Hz: small, so sounds aren't laggy
 RESTART_KEYS = (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_r, pygame.K_SPACE)
+
+# Score: a point for every second survived in play, a bonus for each new level.
+SCORE_PER_SECOND = 1
+SCORE_PER_LEVEL = 50
+NAME_MAX = 8                 # leaderboard names: letters, digits and spaces
+TITLE_PANEL_MS = 7000        # title alternates: character choice <-> Top 10, 7 s each
+TOP_N = 10
+# Hosted leaderboard (dreamlo.com, free tier). Free dreamlo boards are
+# client-side by design: the private code that adds scores ships in the game.
+DREAMLO_PUBLIC = "6ac7b3018f40bc15a8400bbc"
+DREAMLO_PRIVATE = "ywhrA7pmp0ivMlVZTqZoTwfNbQztSs2kSLvG6ZGQ53OQ"
+DREAMLO_URL = "http://dreamlo.com/lb/"
+DREAMLO_TIMEOUT = 4.0        # seconds; every request runs on a background thread
+SAVE_DIR = os.path.join(os.path.expanduser("~"), ".daleks_in_hedges")
+SAVE_FILE = os.path.join(SAVE_DIR, "scores.json")  # last name, local best, cached Top 10, unsent scores
 
 KEY_ACTIONS = {
     pygame.K_LEFT: ("turn", -1),
@@ -1004,6 +1023,159 @@ class Sounds:
             self.start_title_theme()
 
 
+def clean_name(text: str) -> str:
+    """Letters, digits and single spaces only, at most NAME_MAX characters."""
+    out = "".join(ch for ch in str(text) if ch.isascii() and (ch.isalnum() or ch == " "))
+    return " ".join(out.split())[:NAME_MAX]
+
+
+class Leaderboard:
+    """dreamlo Top 10 plus a local cache. All network calls run on daemon
+    threads with a short timeout, so the game never waits and never crashes
+    offline. Scores that could not be sent are kept and retried later."""
+
+    def __init__(self, online: bool = True, path: str = SAVE_FILE):
+        self.online = online
+        self.path = path
+        self.lock = threading.Lock()
+        self.save_lock = threading.Lock()
+        self.entries = []          # [(name, score)], best first
+        self.pending = []          # [(name, score)] still to send
+        self.local_best = 0
+        self.last_name = ""
+        self.status = "cached"     # "cached" | "loading" | "online" | "offline"
+        self.busy = False
+        self._load()
+        if not self.entries and online:
+            self.status = "loading"
+
+    # ----- local file -------------------------------------------------
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.entries = [(clean_name(n), int(v)) for n, v in data.get("top", [])][:TOP_N]
+            self.pending = [(clean_name(n), int(v)) for n, v in data.get("pending", [])]
+            self.local_best = int(data.get("local_best", 0))
+            self.last_name = clean_name(data.get("last_name", ""))
+        except Exception:
+            pass
+
+    def _save(self):
+        if not self.online:
+            return  # headless test runs leave the player's file alone
+        with self.lock:
+            data = {"top": self.entries, "pending": self.pending,
+                    "local_best": self.local_best, "last_name": self.last_name}
+        with self.save_lock:
+            try:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                tmp = self.path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                os.replace(tmp, self.path)
+            except Exception:
+                pass
+
+    # ----- what the game shows ----------------------------------------
+    def top(self, n: int = TOP_N):
+        """Cached dreamlo Top 10 merged with unsent scores (best per name)."""
+        with self.lock:
+            best = {}
+            for name, score in list(self.entries) + list(self.pending):
+                if name and score > best.get(name, -1):
+                    best[name] = score
+        return sorted(best.items(), key=lambda e: (-e[1], e[0]))[:n]
+
+    def high_score(self) -> int:
+        top = self.top(1)
+        return max(self.local_best, top[0][1] if top else 0)
+
+    def record_local(self, score: int):
+        with self.lock:
+            self.local_best = max(self.local_best, int(score))
+        self._save()
+
+    # ----- network ----------------------------------------------------
+    @staticmethod
+    def _get(url: str) -> str:
+        req = urllib.request.Request(url, headers={"User-Agent": "DaleksInHedges/1.0"})
+        with urllib.request.urlopen(req, timeout=DREAMLO_TIMEOUT) as resp:
+            return resp.read().decode("utf-8", "replace")
+
+    @staticmethod
+    def _parse(text: str):
+        board = (json.loads(text).get("dreamlo") or {}).get("leaderboard") or {}
+        entry = board.get("entry") or []
+        if isinstance(entry, dict):  # dreamlo sends a lone entry as an object
+            entry = [entry]
+        out = []
+        for e in entry:
+            try:
+                out.append((clean_name(e.get("name", "")), int(float(e.get("score", 0)))))
+            except (TypeError, ValueError):
+                continue
+        out = [e for e in out if e[0]]
+        out.sort(key=lambda e: (-e[1], e[0]))
+        return out[:TOP_N]
+
+    def _send(self, name: str, score: int) -> bool:
+        url = (DREAMLO_URL + DREAMLO_PRIVATE + "/add/"
+               + urllib.parse.quote(name, safe="") + "/" + str(int(score)))
+        return self._get(url).strip().startswith("OK")
+
+    def _work(self):
+        try:
+            with self.lock:
+                todo = list(self.pending)
+            sent = []
+            for item in todo:
+                try:
+                    if self._send(*item):
+                        sent.append(item)
+                except Exception:
+                    break  # offline: keep the rest for next time
+                time.sleep(1.1)  # dreamlo refuses repeat requests within a second
+            with self.lock:
+                self.pending = [p for p in self.pending if p not in sent]
+            try:
+                entries = self._parse(self._get(DREAMLO_URL + DREAMLO_PUBLIC + "/json"))
+                with self.lock:
+                    self.entries = entries
+                    self.status = "online"
+            except Exception:
+                with self.lock:
+                    self.status = "offline"
+            self._save()
+        finally:
+            with self.lock:
+                self.busy = False
+
+    def _spawn(self, force: bool = False):
+        if not self.online:
+            return
+        with self.lock:
+            if self.busy and not force:
+                return  # a refresh is already on its way
+            self.busy = True
+        threading.Thread(target=self._work, daemon=True).start()
+
+    def refresh(self):
+        self._spawn()
+
+    def submit(self, name: str, score: int):
+        name = clean_name(name)
+        with self.lock:
+            self.last_name = name or self.last_name
+            self.local_best = max(self.local_best, int(score))
+        if name and score > 0:
+            with self.lock:
+                self.pending.append((name, int(score)))
+        self._save()
+        if name and score > 0:
+            self._spawn(force=True)
+
+
 class Dalek:
     """Glides cell to cell along corridors; looks only the way it faces."""
 
@@ -1211,7 +1383,10 @@ def _make_cloak_icon() -> pygame.Surface:
 
 
 class Game:
-    def __init__(self, seed: int | None, level: int = 1, character: str = "archie", title: bool = True):
+    def __init__(self, seed: int | None, level: int = 1, character: str = "archie", title: bool = True,
+                 online: bool = True):
+        self.board = Leaderboard(online=online)
+        self._reset_score()
         self.char_sets = {}
         for cid, info in CHARACTERS.items():
             sprites, anchors, white = _load_char_sprites(info["files"])
@@ -1292,6 +1467,8 @@ class Game:
         self.font_shout = load_font(8, bold=True)
         self.font_hud = load_font(8)
         self.font_hint = load_font(8)
+        self.font_score = load_font(10, bold=True)     # in-play score / high score
+        self.font_entry = load_font(16, bold=True)     # name being typed
         self.cam = (0.0, 0.0)
         self.archie_feet = (0, 0)
         self.sfx = Sounds()
@@ -1335,6 +1512,65 @@ class Game:
         self.anchors = cs["anchors"]
         self.white = cs["white"]
         self.archie_fades = {}
+
+    # ----- Score and leaderboard ------------------------------------------
+    def _reset_score(self):
+        self.survive_ms = 0.0
+        self.level_bonus = 0
+        self.entry_active = False    # typing a name for the leaderboard
+        self.entry_done = False
+        self.entry_name = ""
+        self.entry_note = ""
+        self.final_score = 0
+
+    @property
+    def score(self) -> int:
+        return int(self.survive_ms // 1000) * SCORE_PER_SECOND + self.level_bonus
+
+    def wants_text(self) -> bool:
+        """True while a name is being typed (Esc then skips instead of quitting)."""
+        return self.mode == "play" and self.entry_active
+
+    def _begin_entry(self):
+        self.final_score = self.score
+        self.board.record_local(self.final_score)
+        if self.final_score <= 0:
+            self.entry_done = True
+            return
+        self.entry_active = True
+        self.entry_name = self.board.last_name
+
+    def _entry_status(self) -> str:
+        """Death-panel line about the leaderboard once the name step is over."""
+        name = self.entry_note
+        if self.final_score <= 0:
+            return ""
+        if not name:
+            return "Score not sent"
+        if not self.board.online:
+            return f"Saved as {name}"
+        if (name, self.final_score) in self.board.pending:
+            return f"Sending as {name}" if self.board.busy else "Offline - will send later"
+        return f"Score sent as {name}"
+
+    def _entry_key(self, key: int, text: str):
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            name = clean_name(self.entry_name)
+            if not name:
+                return  # type a name first (Esc skips)
+            self.entry_active = False
+            self.entry_done = True
+            self.entry_note = name
+            self.board.submit(name, self.final_score)
+        elif key == pygame.K_ESCAPE:
+            self.entry_active = False
+            self.entry_done = True
+            self.entry_note = ""
+        elif key == pygame.K_BACKSPACE:
+            self.entry_name = self.entry_name[:-1]
+        elif text and len(text) == 1 and text.isascii() and (text.isalnum() or text == " "):
+            if len(self.entry_name) < NAME_MAX and not (text == " " and (not self.entry_name or self.entry_name.endswith(" "))):
+                self.entry_name += text
 
     def _enter_title(self, seed: int | None = None):
         """Decorative maze with TITLE_DALEKS Daleks; no player, no deaths."""
@@ -1387,6 +1623,8 @@ class Game:
         # Title Daleks never aim/fire: keep them roaming forever.
         for d in self.daleks:
             d.state = "roam"
+        self.title_t0 = None         # character choice first, then the Top 10
+        self.board.refresh()
         self.sfx.start_title_theme()
 
     def _start_game(self, now: float):
@@ -1395,6 +1633,7 @@ class Game:
         self._apply_character(CHAR_ORDER[self.title_pick])
         self.mode = "play"
         self.level = 1
+        self._reset_score()
         self.reset(time.time_ns() & 0x7FFFFFFF, banner=True)
         self.start_t0 = now
         self.last_now = now
@@ -1721,11 +1960,31 @@ class Game:
     def setup_scene(self, name: str, now: float = 0.0) -> float:
         """Arrange a scene and return how long (ms) to simulate before the shot."""
         self.last_now = now
-        if name == "title":
+        if name in ("title", "title_top10"):
             self._enter_title(self.seed)
             self.start_t0 = now
+            self.title_t0 = now - (TITLE_PANEL_MS + 500 if name == "title_top10" else 0)
             return 800.0
         self.mode = "play"
+        if name == "score_hud":
+            # A level under way: a couple of minutes survived plus the level bonuses.
+            self.level_bonus = SCORE_PER_LEVEL * (self.level - 1)
+            self.survive_ms = 127_400.0
+            self._park_other_daleks(None)
+            self.start_t0 = now - DEMAT_WAIT_MS - self.demat_len - 1000
+            self.demat_t0 = self.start_t0 + DEMAT_WAIT_MS
+            self.banner = False
+            return 200.0
+        if name == "name_entry":
+            self.level_bonus = SCORE_PER_LEVEL * (self.level - 1)
+            self.survive_ms = 94_000.0
+            self.start_t0 = now - DEMAT_WAIT_MS - self.demat_len - 1000
+            self.demat_t0 = self.start_t0 + DEMAT_WAIT_MS
+            self.banner = False
+            if not self.board.last_name:
+                self.board.last_name = "Holly" if self.character == "holly" else "Archie"
+            self._kill(now, self.daleks[0])
+            return DEATH_MSG_MS + 300.0
         if name == "tardis_exit":
             # Archie next to the exit, stepping into the TARDIS. --scene-ms
             # counts from that step: he walks in (0.5 s), demat from 0.9 s, then the card.
@@ -1919,13 +2178,19 @@ class Game:
             return steps[0]
         return None
 
-    def on_key(self, key: int, now: float):
+    def on_key(self, key: int, now: float, text: str = ""):
+        if self.wants_text():
+            self._entry_key(key, text)  # letters (M, H, R ...) are typed, not actions
+            return
         if key == MUTE_KEY:
             self.sfx.toggle_mute()
             return
         if self.card_t0 is not None:
             return  # the level card is showing
         if self.mode == "title":
+            if key in (pygame.K_LEFT, pygame.K_a, pygame.K_RIGHT, pygame.K_d,
+                       pygame.K_1, pygame.K_KP1, pygame.K_2, pygame.K_KP2):
+                self.title_t0 = now  # show the characters again while choosing
             if key in (pygame.K_LEFT, pygame.K_a):
                 self.title_pick = (self.title_pick - 1) % len(CHAR_ORDER)
             elif key in (pygame.K_RIGHT, pygame.K_d):
@@ -1937,7 +2202,7 @@ class Game:
             elif key in RESTART_KEYS:
                 self._start_game(now)
             return
-        if key in RESTART_KEYS and self.dead and now - self.death_t0 >= LASER_MS:
+        if key in RESTART_KEYS and self.dead and now - self.death_t0 >= LASER_MS and self.entry_done:
             self._enter_title()  # pick a character again
             return
         if key in DISGUISE_KEYS:
@@ -1980,6 +2245,8 @@ class Game:
         if self.mode == "title":
             if self.start_t0 is None:
                 self.start_t0 = now
+            if self.title_t0 is None:
+                self.title_t0 = now
             # Decorative Daleks only: roam, never aim/fire, and never hum
             # (the title theme plays instead).
             for d in self.daleks:
@@ -2009,6 +2276,10 @@ class Game:
             self.sfx.play("tardis_demat")
         if self.disguised and now - self.disguise_t0 >= DISGUISE_MS:
             self._end_disguise(now)
+        if not self.dead:
+            self.survive_ms += dt  # in play only: not the title, card, exit or death
+        elif not self.entry_active and not self.entry_done and now - self.death_t0 >= DEATH_MSG_MS:
+            self._begin_entry()
         if not self.dead:
             self._update_archie(now)
         if self.disguise_pending and not self.busy() and not self.dead and not self.won:
@@ -2055,6 +2326,7 @@ class Game:
         """Under the black card: the next level gets a brand-new maze."""
         self.card_switched = True
         self.level += 1
+        self.level_bonus += SCORE_PER_LEVEL
         self.reset(time.time_ns() & 0x7FFFFFFF, banner=False)
 
     def start_tardis_up(self, now: float) -> bool:
@@ -2345,14 +2617,23 @@ class Game:
             self._draw_minimap(view)
             self._draw_cloak_hud(view, now)
             self._draw_level_hud(view)
+            self._draw_score_hud(view)
             if self.dead and now - self.death_t0 >= DEATH_MSG_MS:
                 who = self.char_name
-                self._draw_panel(
-                    view, "EXTERMINATED",
-                    f"{who} reached level {self.level}",
-                    (255, 96, 72),
-                    foot="Enter to Play Again",
-                )
+                if self.entry_active:
+                    self._draw_name_entry(view, now)
+                else:
+                    extra = [f"Score {self.final_score}"]
+                    status = self._entry_status()
+                    if status:
+                        extra.append(status)
+                    self._draw_panel(
+                        view, "EXTERMINATED",
+                        f"{who} reached level {self.level}",
+                        (255, 96, 72),
+                        foot="Enter to Play Again",
+                        extra=extra,
+                    )
             self._draw_banners(view, now)
             self._draw_card(view, now)
         if ZOOM_SMOOTH:
@@ -2768,6 +3049,71 @@ class Game:
         screen.blit(box, (8, 8))
         screen.blit(text, (8 + pad_x, 8 + pad_y))
 
+    def _draw_score_hud(self, screen):
+        """Score and high score, under the level box (top-left)."""
+        best = self.board.high_score()
+        score = self.score
+        beating = score > best and best > 0
+        hi = max(best, score)
+        cream, gold = (240, 234, 214), (255, 220, 120)
+        rows = [("Score", str(score), gold if beating else cream),
+                ("High", str(hi), gold if beating else (220, 200, 160))]
+        labels = [self.font_score.render(a, True, c) for a, _, c in rows]
+        values = [self.font_score.render(b, True, c) for _, b, c in rows]
+        pad_x, pad_y, gap, line = 8, 4, 14, self.font_score.get_height()
+        inner_w = max(l.get_width() for l in labels) + gap + max(v.get_width() for v in values)
+        w = max(92, inner_w + pad_x * 2)
+        h = pad_y * 2 + line * len(rows)
+        box = _new_rgba((w, h))
+        box.fill((36, 24, 16, 180))
+        pygame.draw.rect(box, (186, 160, 96, 200), box.get_rect(), 1)
+        for i, (l, v) in enumerate(zip(labels, values)):
+            y = pad_y + i * line
+            box.blit(l, (pad_x, y))
+            box.blit(v, (w - pad_x - v.get_width(), y))
+        y0 = 8 + self.font_hud.get_height() + 10 + 4  # just under the level box
+        screen.blit(_finish_rgba(box), (8, y0))
+
+    def _draw_name_entry(self, screen, now: float):
+        """After a death with points: type a name for the leaderboard."""
+        best = self.board.high_score()
+        cream = (232, 214, 170)
+        title = self.font_big.render("EXTERMINATED", True, (255, 96, 72))
+        sub = self.font_small.render(f"{self.char_name} reached level {self.level}", True, cream)
+        sc = self.font_score.render(f"Score {self.final_score}", True, (255, 236, 170))
+        lines = [title, sub, sc]
+        if self.final_score >= best and self.final_score > 0:
+            lines.append(self.font_score.render("New high score!", True, (255, 220, 120)))
+        prompt = self.font_small.render(f"Enter your name (up to {NAME_MAX} letters)", True, cream)
+        foot = self.font_small.render("Enter to submit    Esc to skip", True, (200, 180, 140))
+        sample = self.font_entry.render("W" * NAME_MAX, True, (0, 0, 0))
+        field_w, field_h = sample.get_width() + 16, sample.get_height() + 8
+        gap = 7
+        blocks = lines + [prompt, None, foot]
+        width = max([t.get_width() for t in blocks if t is not None] + [field_w]) + 40
+        height = sum(t.get_height() if t is not None else field_h for t in blocks) + gap * (len(blocks) - 1) + 26
+        panel = _new_rgba((width, height))
+        panel.fill((36, 24, 16, 255))
+        pygame.draw.rect(panel, (212, 170, 90), panel.get_rect(), 2)
+        y = 13
+        for t in blocks:
+            if t is None:
+                fx = (width - field_w) // 2
+                pygame.draw.rect(panel, (16, 10, 6, 255), (fx, y, field_w, field_h))
+                pygame.draw.rect(panel, (255, 220, 120, 255), (fx, y, field_w, field_h), 1)
+                name = self.font_entry.render(self.entry_name, True, (255, 248, 230))
+                nx = fx + 8
+                panel.blit(name, (nx, y + 4))
+                if int(now / 450) % 2 == 0 and len(self.entry_name) < NAME_MAX:
+                    cx = nx + name.get_width() + 1
+                    pygame.draw.rect(panel, (255, 220, 120, 255), (cx, y + 5, 2, field_h - 10))
+                y += field_h + gap
+                continue
+            panel.blit(t, ((width - t.get_width()) // 2, y))
+            y += t.get_height() + gap
+        panel = _finish_rgba(panel)
+        screen.blit(panel, ((self.view_w - width) // 2, (self.view_h - height) // 2))
+
     def _banner(self, screen, text: str, colour, fade: float, y: int):
         if fade <= 0.02:
             return
@@ -2818,7 +3164,8 @@ class Game:
         if text_fade > 0.02:
             screen.blit(_alpha_scaled(sub, text_fade), ((self.view_w - sub.get_width()) // 2, self.view_h // 2 + 4))
 
-    def _draw_panel(self, screen, title_text: str, sub_text: str, title_colour, foot: str | None = None):
+    def _draw_panel(self, screen, title_text: str, sub_text: str, title_colour, foot: str | None = None,
+                    extra: list[str] | None = None):
         """Death / message panel. No full stops on any line."""
         title_text = title_text.replace(".", "")
         sub_text = sub_text.replace(".", "")
@@ -2827,8 +3174,10 @@ class Game:
         title = self.font_big.render(title_text, True, title_colour)
         sub = self.font_small.render(sub_text, True, (232, 214, 170))
         foot_s = self.font_small.render(foot, True, (232, 214, 170)) if foot else None
+        extra_s = [self.font_score.render(e.replace(".", ""), True, (255, 236, 170) if i == 0 else (200, 180, 140))
+                   for i, e in enumerate(extra or [])]
         gap = 8
-        lines = [title, sub] + ([foot_s] if foot_s else [])
+        lines = [title, sub] + extra_s + ([foot_s] if foot_s else [])
         width = max(t.get_width() for t in lines) + 40
         height = sum(t.get_height() for t in lines) + gap * (len(lines) - 1) + 28
         panel = _new_rgba((width, height))
@@ -2853,9 +3202,58 @@ class Game:
         tx = (self.view_w - title.get_width()) // 2
         screen.blit(shadow, (tx + 1, 8))
         screen.blit(title, (tx, 7))
-        sub = self.font_title_sub.render("Choose Archie or Holly", True, (220, 200, 160))
-        screen.blit(sub, ((self.view_w - sub.get_width()) // 2, 7 + title.get_height() + 4))
+        t0 = self.title_t0 if self.title_t0 is not None else now
+        show_scores = int((now - t0) // TITLE_PANEL_MS) % 2 == 1
+        sub_text = "Top 10 Scores" if show_scores else "Choose Archie or Holly"
+        sub = self.font_title_sub.render(sub_text, True, (220, 200, 160))
+        sub_y = 7 + title.get_height() + 4
+        screen.blit(sub, ((self.view_w - sub.get_width()) // 2, sub_y))
+        if show_scores:
+            self._draw_title_scores(screen, sub_y + sub.get_height() + 6)
+        else:
+            self._draw_title_portraits(screen)
+        self._draw_title_footer(screen)
 
+    def _draw_title_scores(self, screen, top: int):
+        """Top 10 panel (rank, name, score) from dreamlo or the local cache."""
+        entries = self.board.top(TOP_N)
+        status = self.board.status
+        cream, gold, dim = (240, 234, 214), (255, 220, 120), (200, 180, 140)
+        font = self.font_title_help
+        row_h = 14
+        pad_x, pad_y = 16, 8
+        rank_w = font.size("10.")[0]
+        name_w = font.size("W" * NAME_MAX)[0]
+        score_w = font.size("000000")[0]
+        col_gap = 18
+        width = pad_x * 2 + rank_w + col_gap + name_w + col_gap + score_w
+        height = pad_y * 2 + row_h * TOP_N + (row_h if status == "offline" else 0)
+        panel = _new_rgba((width, height))
+        panel.fill((36, 24, 16, 215))
+        pygame.draw.rect(panel, (255, 220, 120, 255), panel.get_rect(), 2)
+        x_rank = pad_x
+        x_name = x_rank + rank_w + col_gap
+        x_score = x_name + name_w + col_gap + score_w  # right edge
+        if not entries:
+            msg = "Loading scores" if status == "loading" else "No scores yet - be the first!"
+            t = font.render(msg, True, cream)
+            panel.blit(t, ((width - t.get_width()) // 2, (height - t.get_height()) // 2))
+        for i in range(TOP_N):
+            y = pad_y + i * row_h
+            colour = gold if i == 0 else (cream if i < 3 else dim)
+            if i < len(entries):
+                name, value = entries[i]
+                r = font.render(f"{i + 1}.", True, colour)
+                panel.blit(r, (x_rank + rank_w - r.get_width(), y))
+                panel.blit(font.render(name, True, colour), (x_name, y))
+                v = font.render(str(value), True, colour)
+                panel.blit(v, (x_score - v.get_width(), y))
+        if status == "offline":
+            t = self.font_title_copy.render("Offline - showing saved scores", True, dim)
+            panel.blit(t, ((width - t.get_width()) // 2, pad_y + row_h * TOP_N + 2))
+        screen.blit(_finish_rgba(panel), ((self.view_w - width) // 2, top))
+
+    def _draw_title_portraits(self, screen):
         # Portraits — boxes sized for the larger title fonts (name under each).
         pad_x, pad_top, pad_bot = 20, 14, 34
         gap = 44
@@ -2888,6 +3286,7 @@ class Game:
                 screen.blit(mark, (bx + (bw - mark.get_width()) // 2, by - 14))
             x0 += img.get_width() + pad_x * 2 + gap
 
+    def _draw_title_footer(self, screen):
         mute = "M unmute" if self.sfx.muted else "M mute"
         lines = [
             "Left/Right or A/D (or 1/2): choose character",
@@ -2919,9 +3318,13 @@ def parse_args(argv):
     parser.add_argument("--character", choices=list(CHAR_ORDER), default="archie",
                         help="playable character (skipped on the title screen)")
     parser.add_argument("--no-title", action="store_true", help="skip the title screen and start playing")
-    parser.add_argument("--scene", choices=("dalek", "laser", "telegraph", "disguise", "tardis", "tardis_demat", "tardis_exit", "title"), default=None,
+    parser.add_argument("--scene", choices=("dalek", "laser", "telegraph", "disguise", "tardis", "tardis_demat", "tardis_exit",
+                                 "title", "title_top10", "score_hud", "name_entry"), default=None,
                         help="debug: arrange a scene, simulate it briefly, then screenshot")
     parser.add_argument("--scene-ms", type=float, default=None, help="debug: override the scene's simulated time")
+    parser.add_argument("--demo-scores", action="store_true",
+                        help="debug: fill the Top 10 with sample names (shown only, never sent)")
+    parser.add_argument("--offline", action="store_true", help="never contact the online leaderboard")
     return parser.parse_args(argv)
 
 
@@ -2935,14 +3338,21 @@ def main(argv=None):
     pygame.display.set_caption("Daleks in Hedges")
     screen = pygame.display.set_mode((WIN_W, WIN_H))
     skip_title = args.no_title or args.scene is not None or args.frames is not None or args.screenshot is not None
-    if args.scene == "title":
+    if args.scene in ("title", "title_top10"):
         skip_title = False
-    game = Game(args.seed, args.level, character=args.character, title=not skip_title)
-    if args.scene == "title":
+    headless = args.screenshot is not None or args.frames is not None or args.scene is not None
+    # Headless test runs never touch the network or the player's score file.
+    game = Game(args.seed, args.level, character=args.character, title=not skip_title,
+                online=not (headless or args.offline))
+    if args.demo_scores:
+        game.board.entries = [("Holly", 1460), ("Archie", 1215), ("Dad", 980), ("Nathan", 744),
+                              ("Rose", 610), ("Clara", 502), ("Amy", 388), ("Rory", 251),
+                              ("K9", 140), ("Davros", 12)]
+        game.board.status = "online"
+    if args.scene in ("title", "title_top10"):
         game.mode = "title"
         if args.character in CHAR_ORDER:
             game.title_pick = CHAR_ORDER.index(args.character)
-    headless = args.screenshot is not None or args.frames is not None or args.scene is not None
 
     if not headless:
         clock = pygame.time.Clock()
@@ -2954,10 +3364,10 @@ def main(argv=None):
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
+                    if event.key == pygame.K_ESCAPE and not game.wants_text():
                         running = False
                     else:
-                        game.on_key(event.key, now)
+                        game.on_key(event.key, now, getattr(event, "unicode", ""))
             if not running:
                 break
             game.hold_action(pygame.key.get_pressed(), now)
