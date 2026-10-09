@@ -235,8 +235,6 @@ SCORE_PER_LEVEL = 50
 SCORE_PER_SPOT = 20          # a Dalek sees you and shouts "Exterminate!"
 MOVE_GRACE_MS = 400          # time still counts this long after a step lands (tap gaps)
 BONUS_POP_MS = 1100          # the "+20" pop beside the Score box
-_EGGS = {"archieog": 1000, "myrtle": 165890}  # name entry extras (case-insensitive)
-EGG_POP_MS = 1800
 NAME_MAX = 8                 # leaderboard names: letters, digits and spaces
 TITLE_PANEL_MS = 7000        # title alternates: character choice <-> Top 10, 7 s each
 TOP_N = 10
@@ -1532,13 +1530,11 @@ class Game:
         self.entry_name = ""
         self.entry_note = ""
         self.final_score = 0
-        self.egg_bonus = 0
-        self.egg_pop_t0 = None
 
     @property
     def score(self) -> int:
         return (int(self.survive_ms // 1000) * SCORE_PER_SECOND + self.level_bonus
-                + self.spot_bonus + self.egg_bonus)
+                + self.spot_bonus)
 
     def _on_the_move(self, now: float) -> bool:
         """Time points only while Archie is actually travelling between cells,
@@ -1583,11 +1579,6 @@ class Game:
             self.entry_active = False
             self.entry_done = True
             self.entry_note = name
-            egg = _EGGS.get(name.strip().lower(), 0)
-            if egg and not self.egg_bonus:
-                self.egg_bonus = egg  # once per death
-                self.final_score += egg
-                self.egg_pop_t0 = now
             self.board.submit(name, self.final_score)
         elif key == pygame.K_ESCAPE:
             self.entry_active = False
@@ -2669,10 +2660,6 @@ class Game:
                     if status:
                         extra.append(status)
                     pop = None
-                    if self.egg_pop_t0 is not None:
-                        t = (now - self.egg_pop_t0) / EGG_POP_MS
-                        if 0.0 <= t < 1.0:
-                            pop = (f"+{self.egg_bonus}", t)
                     self._draw_panel(
                         view, "EXTERMINATED",
                         f"{who} reached level {self.level}",
